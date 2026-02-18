@@ -1,0 +1,158 @@
+@import "tailwindcss";
+@plugin "@tailwindcss/typography";
+
+@custom-variant dark (&:is(.dark *));
+
+:root {
+  /* Artifactor Ink Palette — Calm Authority */
+  --background: #ffffff;
+  --foreground: #2d3436;
+
+  --card: #ffffff;
+  --card-foreground: #2d3436;
+
+  --popover: #ffffff;
+  --popover-foreground: #2d3436;
+
+  --primary: #000000;
+  --primary-foreground: #ffffff;
+
+  --secondary: #f5f5f4;
+  --secondary-foreground: #2d3436;
+
+  --muted: #f5f5f4;
+  --muted-foreground: #5a5a58;
+
+  --accent: #f5f5f4;
+  --accent-foreground: #2d3436;
+
+  --destructive: #dc2626;
+  --destructive-foreground: #ffffff;
+
+  --border: oklch(0.922 0 0);
+  --input: oklch(0.922 0 0);
+  --ring: #000000;
+
+  --heading: #0f172a;
+
+  --radius: 0.625rem;
+}
+
+.dark {
+  --background: #0a0a0a;
+  --foreground: #f5f5f5;
+
+  --card: #1a1a1a;
+  --card-foreground: #f5f5f5;
+
+  --popover: #1a1a1a;
+  --popover-foreground: #f5f5f5;
+
+  --primary: #f5f5f5;
+  --primary-foreground: #0a0a0a;
+
+  --secondary: #262626;
+  --secondary-foreground: #f5f5f5;
+
+  --muted: #262626;
+  --muted-foreground: #999999;
+
+  --accent: #262626;
+  --accent-foreground: #f5f5f5;
+
+  --destructive: #ef4444;
+  --destructive-foreground: #ffffff;
+
+  --border: rgba(255, 255, 255, 0.1);
+  --input: rgba(255, 255, 255, 0.15);
+  --ring: #f5f5f5;
+
+  --heading: #f5f5f5;
+}
+
+@theme inline {
+  --font-sans: system-ui, -apple-system, sans-serif;
+  --font-mono: ui-monospace, monospace;
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-heading: var(--heading);
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+
+  --shadow-xs: 0 1px 2px 0 color-mix(in oklch, var(--color-foreground) 5%, transparent);
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  html {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+    height: 100%;
+    overflow: hidden;
+  }
+
+  h1, h2, h3, h4, h5, h6 {
+    @apply font-semibold tracking-tight;
+    color: var(--heading);
+  }
+
+  :focus-visible {
+    @apply outline-none ring-2 ring-ring ring-offset-2 ring-offset-background;
+  }
+}
+
+@layer components {
+  .touch-target {
+    min-height: 44px;
+    min-width: 44px;
+  }
+
+  /* Typing indicator animation */
+  @keyframes typing-bounce {
+    0%, 60%, 100% { opacity: 0.3; transform: translateY(0); }
+    30% { opacity: 1; transform: translateY(-4px); }
+  }
+
+  .typing-dot {
+    animation: typing-bounce 1.4s ease-in-out infinite;
+  }
+  .typing-dot:nth-child(2) { animation-delay: 0.16s; }
+  .typing-dot:nth-child(3) { animation-delay: 0.32s; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

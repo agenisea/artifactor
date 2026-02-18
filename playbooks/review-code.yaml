@@ -1,0 +1,30 @@
+name: review-code
+title: "Code Review with Security Context"
+description: >
+  Examine a file's symbols, trace call relationships, check security
+  findings, and load the feature spec so an agent can produce a
+  thorough code review.
+agent: claude
+difficulty: intermediate
+estimated_time: "2-4 minutes"
+mcp_prompt: review_code
+tags:
+  - code-review
+  - security
+  - quality
+
+steps:
+  - description: "Examine the target symbol's purpose and structure"
+    tool: explain_symbol
+  - description: "Trace callers and callees to understand coupling"
+    tool: get_call_graph
+  - description: "Check security findings for the affected area"
+    tool: get_security_findings
+  - description: "Load the feature specification for business context"
+    tool: get_specification
+  - description: "List API endpoints touched by this code"
+    tool: get_api_endpoints
+
+example_prompt: >
+  Use the review_code prompt to review src/api/routes/users.py.
+  Focus on authentication logic and input validation.

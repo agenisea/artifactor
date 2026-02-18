@@ -1,0 +1,30 @@
+name: fix-bug
+title: "Fix a Bug with Full Context"
+description: >
+  Locate relevant code, trace the call graph, check security implications,
+  and provide an agent with complete context to write an accurate fix.
+agent: claude
+difficulty: intermediate
+estimated_time: "2-5 minutes"
+mcp_prompt: fix_bug
+tags:
+  - bug-fix
+  - debugging
+  - code-intelligence
+
+steps:
+  - description: "Search codebase for code related to the bug"
+    tool: query_codebase
+  - description: "Examine the buggy function's purpose and relationships"
+    tool: explain_symbol
+  - description: "Trace callers/callees to understand blast radius"
+    tool: get_call_graph
+  - description: "Check for security implications"
+    tool: get_security_findings
+  - description: "Get the feature spec to understand intended behavior"
+    tool: get_specification
+
+example_prompt: >
+  Use the fix_bug prompt to help me fix: login fails when
+  email contains a plus sign. The bug is in src/auth/login.py,
+  function authenticate_user.

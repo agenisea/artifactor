@@ -1,0 +1,31 @@
+name: migration-plan
+title: "Plan a Migration with Risk Analysis"
+description: >
+  Assemble system specs, feature inventory, data models, security
+  constraints, and API surface to help an agent produce a safe,
+  ordered migration plan with risk analysis.
+agent: claude
+difficulty: advanced
+estimated_time: "3-7 minutes"
+mcp_prompt: migration_plan
+tags:
+  - migration
+  - planning
+  - risk-analysis
+
+steps:
+  - description: "Load the system specification and architecture"
+    tool: get_specification
+  - description: "Inventory all features that must be preserved"
+    tool: list_features
+  - description: "Inspect data models for schema migration needs"
+    tool: get_data_model
+  - description: "Check security constraints that affect migration"
+    tool: get_security_findings
+  - description: "List API endpoints for backwards-compatibility planning"
+    tool: get_api_endpoints
+
+example_prompt: >
+  Use the migration_plan prompt to plan migrating our database
+  from PostgreSQL to CockroachDB. Consider all schema changes,
+  data models, and security constraints.

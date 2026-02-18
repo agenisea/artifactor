@@ -1,0 +1,30 @@
+name: write-tests
+title: "Write Tests from User Stories"
+description: >
+  Gather user stories, examine target code, inspect data models and API
+  endpoints, then provide an agent with everything needed to write
+  BDD-style test specifications.
+agent: claude
+difficulty: intermediate
+estimated_time: "3-5 minutes"
+mcp_prompt: write_tests
+tags:
+  - testing
+  - bdd
+  - coverage
+
+steps:
+  - description: "Retrieve user stories and acceptance criteria"
+    tool: get_user_stories
+  - description: "Examine the target function or class"
+    tool: explain_symbol
+  - description: "Inspect data models used by the target code"
+    tool: get_data_model
+  - description: "List API endpoints to understand integration surface"
+    tool: get_api_endpoints
+  - description: "Search for existing test entities and patterns"
+    tool: search_code_entities
+
+example_prompt: >
+  Use the write_tests prompt to generate BDD test specs for
+  src/payments/checkout.py, focusing on the process_payment function.

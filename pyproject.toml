@@ -1,0 +1,81 @@
+[project]
+name = "artifactor"
+version = "0.1.0"
+description = "Open-source code intelligence infrastructure — builds a queryable Intelligence Model from any codebase. MCP server, REST API, and playbooks for AI agents and teams."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+
+dependencies = [
+    "fastapi>=0.128",
+    "uvicorn>=0.40",
+    "sqlalchemy>=2.0.46",
+    "aiosqlite>=0.21",
+    "greenlet>=3.2",
+    "pydantic>=2.12",
+    "pydantic-ai>=1.6.0",
+    "pydantic-settings>=2.12",
+    "litellm>=1.65",
+    "anthropic>=0.72",
+    "tree-sitter>=0.25.2",
+    "tree-sitter-python>=0.23",
+    "tree-sitter-javascript>=0.23",
+    "tree-sitter-typescript>=0.23",
+    "tree-sitter-java>=0.23",
+    "tree-sitter-go>=0.23",
+    "tree-sitter-rust>=0.23",
+    "tree-sitter-c>=0.23",
+    "tree-sitter-cpp>=0.23",
+    "lancedb>=0.25.3",
+    "sse-starlette>=3.0",
+    "fastmcp>=2.0,<3",
+    "weasyprint>=67.0",
+    "circuitbreaker>=2.0",
+    "tenacity>=9.1",
+    "pathspec>=0.12",
+]
+
+[project.optional-dependencies]
+langsmith = [
+    "langsmith>=0.2",
+]
+dev = [
+    "ruff>=0.14",
+    "pyright>=1.1.403",
+    "pytest>=8.4",
+    "pytest-asyncio>=1.3",
+    "pydantic-evals>=1.0",
+]
+
+[project.scripts]
+artifactor = "artifactor.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/artifactor"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["B008"]  # Depends()/Query() in FastAPI defaults
+
+[tool.ruff.lint.isort]
+known-first-party = ["artifactor"]
+
+[tool.pyright]
+pythonVersion = "3.12"
+typeCheckingMode = "strict"
+include = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = [
+    "ignore:enable_cleanup_closed:DeprecationWarning",
+]

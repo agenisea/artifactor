@@ -1,0 +1,44 @@
+services:
+  backend:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      - HOSTNAME=0.0.0.0
+
+  # --- MCP Server (uncomment to expose MCP over SSE from Docker) ---
+  # Note: MCP server shares SQLite with backend — read-only tools are safe,
+  # write operations may contend under concurrent load.
+  # mcp:
+  #   build: .
+  #   command: uv run --no-dev artifactor mcp --transport sse --host 0.0.0.0 --port 8001
+  #   ports:
+  #     - "8001:8001"
+  #   env_file:
+  #     - path: .env
+  #       required: false
+  #   volumes:
+  #     - ./data:/app/data
+  #   depends_on:
+  #     backend:
+  #       condition: service_healthy

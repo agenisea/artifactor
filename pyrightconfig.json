@@ -1,0 +1,8 @@
+{
+  "pythonVersion": "3.12",
+  "typeCheckingMode": "strict",
+  "include": ["src"],
+  "exclude": ["tests", "evals", "data", "logs", "frontend", "npm"],
+  "reportMissingTypeStubs": false,
+  "reportUnusedFunction": false
+}

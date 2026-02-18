@@ -1,0 +1,31 @@
+name: explain-repo
+title: "Understand a Repository"
+description: >
+  Generate a comprehensive project briefing by loading the specification,
+  feature list, data models, API surface, and call graph to give an
+  agent (or a new team member) a full picture of the codebase.
+agent: claude
+difficulty: beginner
+estimated_time: "1-3 minutes"
+mcp_prompt: explain_repo
+tags:
+  - onboarding
+  - documentation
+  - overview
+
+steps:
+  - description: "Load the project specification and architecture overview"
+    tool: get_specification
+  - description: "List all discovered features"
+    tool: list_features
+  - description: "Inspect data models and their relationships"
+    tool: get_data_model
+  - description: "List API endpoints for the public surface area"
+    tool: get_api_endpoints
+  - description: "Trace key call graphs to understand control flow"
+    tool: get_call_graph
+
+example_prompt: >
+  Use the explain_repo prompt to give me a full briefing on this
+  project. I just joined the team and need to understand the
+  architecture, features, and data models.
