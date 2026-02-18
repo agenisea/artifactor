@@ -1,9 +1,15 @@
+import { PageHeader } from "@/components/layout/page-header";
 import { Button } from "@/components/ui/button";
 
 export default function DocsPage() {
   return (
     <div className="h-full overflow-y-auto p-8 max-w-4xl mx-auto">
-      <h1 className="text-3xl font-bold mb-8">Developer Documentation</h1>
+      <PageHeader
+        backHref="/"
+        backLabel="Back to Home"
+        title="Developer Documentation"
+        variant="inline"
+      />
       <div className="space-y-8">
         <section>
           <h2 className="text-xl font-semibold mb-2">API Reference</h2>

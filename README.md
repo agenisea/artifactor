@@ -6,6 +6,8 @@ Open-source code intelligence infrastructure. Builds a programmable Intelligence
 
 Artifactor combines tree-sitter static analysis with LLM inference to produce a structured Intelligence Model: a knowledge graph of entities and relationships, a reasoning graph of purposes and business rules, and 13 documentation sections — each backed by verifiable citations to your source code. It runs on your infrastructure, stores nothing in the cloud, and works with any LLM backend.
 
+![Artifactor Demo](assets/demo.gif)
+
 ## What You Get
 
 Point Artifactor at a repository. It builds three layers:
