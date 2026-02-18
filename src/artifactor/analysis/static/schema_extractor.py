@@ -31,12 +31,18 @@ def extract_schemas(
 
     for chunk in chunked_files.chunks:
         if chunk.language == "sql":
-            entities.extend(_parse_sql_chunk(chunk.content, str(chunk.file_path), chunk.start_line))
+            path = str(chunk.file_path)
+            entities.extend(
+                _parse_sql_chunk(chunk.content, path, chunk.start_line)
+            )
 
     # Look for ORM patterns in Python files
     for chunk in chunked_files.chunks:
         if chunk.language == "python":
-            entities.extend(_parse_python_orm(chunk.content, str(chunk.file_path), chunk.start_line))
+            path = str(chunk.file_path)
+            entities.extend(
+                _parse_python_orm(chunk.content, path, chunk.start_line)
+            )
 
     return SchemaMap(entities=entities)
 
@@ -51,7 +57,8 @@ def _parse_sql_chunk(
     i = 0
     while i < len(lines):
         line = lines[i].strip()
-        m = re.match(r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)\s*\(", line, re.IGNORECASE)
+        pattern = r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)\s*\("
+        m = re.match(pattern, line, re.IGNORECASE)
         if m:
             table_name = m.group(1)
             start_line = base_line + i
@@ -208,7 +215,7 @@ def _parse_python_orm(
 
         # Scan body lines for Column() / mapped_column() / relationship()
         j = i + 1
-        while j < len(lines) and (lines[j].startswith(" ") or lines[j].startswith("\t") or not lines[j].strip()):
+        while j < len(lines) and _is_indented_or_blank(lines[j]):
             stripped = lines[j].strip()
 
             # Column() or mapped_column()
@@ -256,6 +263,11 @@ def _parse_python_orm(
             )
 
     return entities
+
+
+def _is_indented_or_blank(line: str) -> bool:
+    """Return True if the line is indented or blank (class body)."""
+    return line.startswith((" ", "\t")) or not line.strip()
 
 
 def _infer_sqlalchemy_type(args: str) -> str:

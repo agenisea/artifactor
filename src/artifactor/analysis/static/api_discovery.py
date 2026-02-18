@@ -5,10 +5,10 @@ from __future__ import annotations
 import re
 
 from artifactor.analysis.static.schemas import (
-    ASTForest,
     APIEndpoint,
     APIEndpoints,
     APIParameter,
+    ASTForest,
 )
 from artifactor.ingestion.schemas import ChunkedFiles, LanguageMap
 
