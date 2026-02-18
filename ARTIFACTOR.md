@@ -58,7 +58,7 @@ Uses LLM synthesis with template fallback. Each of the 13 section generators col
 - **Protocol-based repositories** — `typing.Protocol` interfaces for all data access (entity, document, conversation, relationship, project)
 - **Typed pipeline** — `PipelineStage[TInput, TOutput]` + `ParallelGroup` with semaphore-bounded concurrency
 - **Intelligence Model** — `KnowledgeGraph` (entities + relationships, cycle-safe traversal) + `ReasoningGraph` (purposes, rules, workflows)
-- **SSE streaming** — `sse-starlette` for analysis progress and chat responses
+- **SSE streaming** — `sse-starlette`, `sse-kit` for analysis progress and chat responses
 - **RAG pipeline** — Hybrid vector (LanceDB) + keyword (SQLite FTS) search, merged via Reciprocal Rank Fusion (RRF)
 - **Citation guardrails** — Every generated claim cites source code; citations verified against the source tree in the pipeline
 
