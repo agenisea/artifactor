@@ -1,7 +1,12 @@
-"""Agent tool registration with error handling."""
+"""Agent tool registration with error handling.
+
+Tools are thin wrappers that extract deps from RunContext and delegate
+to do_*() functions in tool_logic.py. Subset registration functions
+allow specialized agents to register only their relevant tools.
+"""
 
 # pyright: reportUnusedFunction=false
-# All functions in register_tools() are registered via @agent.tool
+# All functions in register_*() are registered via @agent.tool
 
 from __future__ import annotations
 
@@ -13,7 +18,23 @@ from pydantic_ai import Agent, RunContext
 
 from artifactor.agent.deps import AgentDeps
 from artifactor.agent.schemas import AgentResponse
-from artifactor.constants import CALL_GRAPH_MAX_DEPTH, CALL_GRAPH_MIN_DEPTH
+from artifactor.agent.tool_logic import (
+    do_explain_symbol,
+    do_get_api_endpoints,
+    do_get_call_graph,
+    do_get_data_model,
+    do_get_security_findings,
+    do_get_specification,
+    do_get_user_stories,
+    do_list_features,
+    do_query_codebase,
+    do_search_code_entities,
+)
+from artifactor.constants import (
+    CALL_GRAPH_DEFAULT_DEPTH,
+    CALL_GRAPH_DEFAULT_DIRECTION,
+    ERROR_TRUNCATION_CHARS,
+)
 
 
 def handle_tool_errors(
@@ -26,46 +47,42 @@ def handle_tool_errors(
         try:
             return await fn(*args, **kwargs)
         except Exception as exc:
+            msg = str(exc)[:ERROR_TRUNCATION_CHARS]
             return (
-                f"Tool error ({type(exc).__name__}): {exc}"
+                f"Tool error ({type(exc).__name__}): {msg}"
             )
 
     return wrapper
 
 
+# ── Full registration (general agent) ─────────────────
+
+
 def register_tools(
     agent: Agent[AgentDeps, AgentResponse],
 ) -> None:
-    """Register all 10 agent tools on the given agent instance."""
+    """Register all 10 agent tools on the given agent instance.
 
-    @agent.tool
-    @handle_tool_errors
-    async def query_codebase(
-        ctx: RunContext[AgentDeps],
-        question: str,
-    ) -> str:
-        """Search the codebase using hybrid vector + keyword search.
+    search_code_entities is shared between code exploration and
+    search subsets — registered once here to avoid name conflict.
+    """
+    register_lookup_tools(agent)
+    register_code_exploration_tools(agent)
+    # Only query_codebase from search (search_code_entities
+    # already registered by code_exploration above)
+    _register_query_codebase_tool(agent)
 
-        Returns relevant code entities, documentation sections,
-        and semantic matches with source citations.
-        """
-        from artifactor.chat.rag_pipeline import (
-            retrieve_context,
-        )
 
-        deps = ctx.deps
-        context = await retrieve_context(
-            query=question,
-            project_id=deps.project_id,
-            entity_repo=deps.entity_repo,
-            document_repo=deps.document_repo,
-        )
-        if not context.formatted:
-            return (
-                f"No relevant results found for: "
-                f"{question}"
-            )
-        return context.formatted
+# ── Subset registrations (specialist agents) ──────────
+
+
+def register_lookup_tools(
+    agent: Agent[AgentDeps, AgentResponse],
+) -> None:
+    """Register 5 lookup tools.
+
+    Tools: specification, features, stories, endpoints, findings.
+    """
 
     @agent.tool
     @handle_tool_errors
@@ -81,15 +98,9 @@ def register_tools(
         integrations, tech_stories, security_considerations.
         """
         deps = ctx.deps
-        doc = await deps.document_repo.get_section(
-            deps.project_id, section
+        return await do_get_specification(
+            section, deps.project_id, deps.document_repo
         )
-        if doc is None:
-            return (
-                f"Section '{section}' not yet generated "
-                "for this project."
-            )
-        return doc.content
 
     @agent.tool
     @handle_tool_errors
@@ -98,152 +109,9 @@ def register_tools(
     ) -> str:
         """List all discovered features with code mappings."""
         deps = ctx.deps
-        doc = await deps.document_repo.get_section(
-            deps.project_id, "features"
+        return await do_list_features(
+            deps.project_id, deps.document_repo
         )
-        if doc is None:
-            return "Feature analysis not yet complete."
-        return doc.content
-
-    @agent.tool
-    @handle_tool_errors
-    async def get_data_model(
-        ctx: RunContext[AgentDeps],
-        entity: str = "",
-    ) -> str:
-        """Get entity attributes, types, and relationships.
-
-        If entity is provided, returns details for that entity.
-        Otherwise returns the full ER model.
-        """
-        deps = ctx.deps
-        if entity:
-            entities = await deps.entity_repo.search(
-                deps.project_id, entity, entity_type="table"
-            )
-            if not entities:
-                return f"Entity '{entity}' not found."
-            parts = [
-                f"{e.name} ({e.entity_type}) at "
-                f"{e.file_path}:{e.start_line}"
-                for e in entities
-            ]
-            return "\n".join(parts)
-        doc = await deps.document_repo.get_section(
-            deps.project_id, "data_models"
-        )
-        if doc is None:
-            return "Data model analysis not yet complete."
-        return doc.content
-
-    @agent.tool
-    @handle_tool_errors
-    async def explain_symbol(
-        ctx: RunContext[AgentDeps],
-        file_path: str,
-        symbol_name: str = "",
-    ) -> str:
-        """Explain purpose, callers, and callees for a symbol."""
-        deps = ctx.deps
-        entities = await deps.entity_repo.get_by_path(
-            deps.project_id, file_path
-        )
-        if not entities:
-            return f"No entities found at '{file_path}'."
-        if symbol_name:
-            entities = [
-                e for e in entities if e.name == symbol_name
-            ]
-            if not entities:
-                return (
-                    f"Symbol '{symbol_name}' not found "
-                    f"in '{file_path}'."
-                )
-        callers = await deps.relationship_repo.get_callers(
-            deps.project_id,
-            file_path,
-            symbol_name,
-            depth=2,
-        )
-        callees = await deps.relationship_repo.get_callees(
-            deps.project_id,
-            file_path,
-            symbol_name,
-            depth=2,
-        )
-        parts = [f"Entities at {file_path}:"]
-        for e in entities:
-            parts.append(
-                f"  - {e.name} ({e.entity_type}) "
-                f"lines {e.start_line}-{e.end_line}"
-            )
-        if callers:
-            parts.append("Callers:")
-            for c in callers:
-                parts.append(
-                    f"  - {c.source_file}:{c.source_symbol}"
-                )
-        if callees:
-            parts.append("Callees:")
-            for c in callees:
-                parts.append(
-                    f"  - {c.target_file}:{c.target_symbol}"
-                )
-        return "\n".join(parts)
-
-    @agent.tool
-    @handle_tool_errors
-    async def get_call_graph(
-        ctx: RunContext[AgentDeps],
-        file_path: str,
-        symbol_name: str,
-        direction: str = "both",
-        depth: int = 2,
-    ) -> str:
-        """Get call graph for a function or method.
-
-        direction: 'callers', 'callees', or 'both'.
-        depth: traversal depth (1-5).
-        """
-        deps = ctx.deps
-        depth = min(max(depth, CALL_GRAPH_MIN_DEPTH), CALL_GRAPH_MAX_DEPTH)
-        parts: list[str] = []
-        if direction in ("callers", "both"):
-            callers = await deps.relationship_repo.get_callers(
-                deps.project_id,
-                file_path,
-                symbol_name,
-                depth=depth,
-            )
-            parts.append(
-                f"Callers of {symbol_name} (depth={depth}):"
-            )
-            for c in callers:
-                parts.append(
-                    f"  {c.source_file}:{c.source_symbol} "
-                    f"-> {c.target_symbol}"
-                )
-        if direction in ("callees", "both"):
-            callees = await deps.relationship_repo.get_callees(
-                deps.project_id,
-                file_path,
-                symbol_name,
-                depth=depth,
-            )
-            parts.append(
-                f"Callees of {symbol_name} (depth={depth}):"
-            )
-            for c in callees:
-                parts.append(
-                    f"  {c.source_symbol} -> "
-                    f"{c.target_file}:{c.target_symbol}"
-                )
-        if not parts:
-            return (
-                f"No call graph data for "
-                f"{file_path}:{symbol_name}."
-            )
-        return "\n".join(parts)
 
     @agent.tool
     @handle_tool_errors
@@ -257,19 +125,9 @@ def register_tools(
         Optionally filter by epic name or persona.
         """
         deps = ctx.deps
-        doc = await deps.document_repo.get_section(
-            deps.project_id, "user_stories"
+        return await do_get_user_stories(
+            deps.project_id, deps.document_repo, epic, persona
         )
-        if doc is None:
-            return "User stories not yet generated."
-        content = doc.content
-        if epic:
-            content = f"[Filtered by epic: {epic}]\n{content}"
-        if persona:
-            content = (
-                f"[Filtered by persona: {persona}]\n{content}"
-            )
-        return content
 
     @agent.tool
     @handle_tool_errors
@@ -283,28 +141,138 @@ def register_tools(
         Optionally filter by path pattern or HTTP method.
         """
         deps = ctx.deps
-        entities = await deps.entity_repo.search(
+        return await do_get_api_endpoints(
             deps.project_id,
-            query=path_filter,
-            entity_type="endpoint",
+            deps.entity_repo,
+            path_filter,
+            method,
         )
-        if method:
-            entities = [
-                e
-                for e in entities
-                if method.upper()
-                in (e.signature or "").upper()
-            ]
-        if not entities:
-            return "No API endpoints found."
-        parts = ["Discovered API endpoints:"]
-        for e in entities:
-            sig = e.signature or "UNKNOWN"
-            parts.append(
-                f"  {sig} {e.name} "
-                f"[{e.file_path}:{e.start_line}]"
-            )
-        return "\n".join(parts)
+
+    @agent.tool
+    @handle_tool_errors
+    async def get_security_findings(
+        ctx: RunContext[AgentDeps],
+        severity: str = "",
+        category: str = "",
+    ) -> str:
+        """Get security findings with affected files.
+
+        Optionally filter by severity or category.
+        """
+        deps = ctx.deps
+        return await do_get_security_findings(
+            deps.project_id,
+            deps.document_repo,
+            severity,
+            category,
+        )
+
+
+def register_code_exploration_tools(
+    agent: Agent[AgentDeps, AgentResponse],
+) -> None:
+    """Register 4 code exploration tools: symbol, call graph, data model, search."""
+
+    @agent.tool
+    @handle_tool_errors
+    async def explain_symbol(
+        ctx: RunContext[AgentDeps],
+        file_path: str,
+        symbol_name: str = "",
+    ) -> str:
+        """Explain purpose, callers, and callees for a symbol."""
+        deps = ctx.deps
+        return await do_explain_symbol(
+            file_path,
+            deps.project_id,
+            deps.entity_repo,
+            deps.relationship_repo,
+            symbol_name,
+        )
+
+    @agent.tool
+    @handle_tool_errors
+    async def get_call_graph(
+        ctx: RunContext[AgentDeps],
+        file_path: str,
+        symbol_name: str,
+        direction: str = CALL_GRAPH_DEFAULT_DIRECTION,
+        depth: int = CALL_GRAPH_DEFAULT_DEPTH,
+    ) -> str:
+        """Get call graph for a function or method.
+
+        direction: 'callers', 'callees', or 'both'.
+        depth: traversal depth (1-5).
+        """
+        deps = ctx.deps
+        return await do_get_call_graph(
+            file_path,
+            symbol_name,
+            deps.project_id,
+            deps.relationship_repo,
+            direction,
+            depth,
+        )
+
+    @agent.tool
+    @handle_tool_errors
+    async def get_data_model(
+        ctx: RunContext[AgentDeps],
+        entity: str = "",
+    ) -> str:
+        """Get entity attributes, types, and relationships.
+
+        If entity is provided, returns details for that entity.
+        Otherwise returns the full ER model.
+        """
+        deps = ctx.deps
+        return await do_get_data_model(
+            deps.project_id,
+            deps.entity_repo,
+            deps.document_repo,
+            entity,
+        )
+
+    _register_search_code_entities_tool(agent)
+
+
+def _register_query_codebase_tool(
+    agent: Agent[AgentDeps, AgentResponse],
+) -> None:
+    """Register query_codebase tool (private helper)."""
+
+    @agent.tool
+    @handle_tool_errors
+    async def query_codebase(
+        ctx: RunContext[AgentDeps],
+        question: str,
+    ) -> str:
+        """Search the codebase using hybrid vector + keyword search.
+
+        Returns relevant code entities, documentation sections,
+        and semantic matches with source citations.
+        """
+        deps = ctx.deps
+        return await do_query_codebase(
+            question,
+            deps.project_id,
+            deps.entity_repo,
+            deps.document_repo,
+        )
+
+
+def register_search_tools(
+    agent: Agent[AgentDeps, AgentResponse],
+) -> None:
+    """Register 2 search tools: query codebase, search entities."""
+    _register_query_codebase_tool(agent)
+    _register_search_code_entities_tool(agent)
+
+
+def _register_search_code_entities_tool(
+    agent: Agent[AgentDeps, AgentResponse],
+) -> None:
+    """Register search_code_entities tool (private helper)."""
 
     @agent.tool
     @handle_tool_errors
@@ -319,47 +287,9 @@ def register_tools(
         module, endpoint, table).
         """
         deps = ctx.deps
-        entities = await deps.entity_repo.search(
-            deps.project_id,
+        return await do_search_code_entities(
             query,
-            entity_type=entity_type or None,
+            deps.project_id,
+            deps.entity_repo,
+            entity_type,
         )
-        if not entities:
-            return f"No entities found matching '{query}'."
-        parts = [f"Found {len(entities)} entities:"]
-        for e in entities:
-            parts.append(
-                f"  {e.name} ({e.entity_type}) at "
-                f"{e.file_path}:{e.start_line}"
-            )
-        return "\n".join(parts)
-
-    @agent.tool
-    @handle_tool_errors
-    async def get_security_findings(
-        ctx: RunContext[AgentDeps],
-        severity: str = "",
-        category: str = "",
-    ) -> str:
-        """Get security findings with affected files.
-
-        Optionally filter by severity or category.
-        """
-        deps = ctx.deps
-        doc = await deps.document_repo.get_section(
-            deps.project_id, "security_considerations"
-        )
-        if doc is None:
-            return "Security analysis not yet complete."
-        content = doc.content
-        if severity:
-            content = (
-                f"[Filtered by severity: {severity}]\n"
-                f"{content}"
-            )
-        if category:
-            content = (
-                f"[Filtered by category: {category}]\n"
-                f"{content}"
-            )
-        return content

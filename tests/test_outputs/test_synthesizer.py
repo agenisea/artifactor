@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -15,6 +16,31 @@ from artifactor.outputs.synthesizer import (
     synthesize_section,
 )
 
+# Content strings >= SECTION_MIN_LENGTH (50 chars)
+_VALID_CONTENT = (
+    "# Overview\n\n"
+    "This is a comprehensive project overview section "
+    "with enough detail to pass validation."
+)
+_VALID_FALLBACK = (
+    "# Fallback\n\n"
+    "This fallback content from the second model is "
+    "long enough to pass the validation threshold."
+)
+_VALID_FENCED = (
+    "```markdown\n"
+    "# Title\n\n"
+    "This is the fenced body content that should be "
+    "unwrapped and still pass minimum length checks.\n"
+    "```"
+)
+_VALID_FENCED_STRIPPED = (
+    "# Title\n\n"
+    "This is the fenced body content that should be "
+    "unwrapped and still pass minimum length checks."
+)
+_SHORT_CONTENT = "Too short"
+
 
 def _make_settings() -> Settings:
     return Settings(
@@ -24,7 +50,9 @@ def _make_settings() -> Settings:
     )
 
 
-def _make_llm_result(content: str = "# Hello\nWorld") -> LLMCallResult:
+def _make_llm_result(
+    content: str = _VALID_CONTENT,
+) -> LLMCallResult:
     return LLMCallResult(
         content=content,
         model="model-a",
@@ -59,7 +87,7 @@ class TestSynthesizeSection:
         with patch(
             "artifactor.outputs.synthesizer.guarded_llm_call",
             new_callable=AsyncMock,
-            return_value=_make_llm_result("# Overview\nGreat project."),
+            return_value=_make_llm_result(_VALID_CONTENT),
         ):
             result = await synthesize_section(
                 "executive_overview",
@@ -70,7 +98,7 @@ class TestSynthesizeSection:
 
         assert result is not None
         assert isinstance(result, SynthesisResult)
-        assert "Great project" in result.content
+        assert "project overview" in result.content
         assert result.confidence == Confidence.LLM_SECTION_RICH
         assert result.model_used == "model-a"
         assert result.input_tokens == 100
@@ -85,7 +113,7 @@ class TestSynthesizeSection:
             new_callable=AsyncMock,
             side_effect=[
                 RuntimeError("model-a down"),
-                _make_llm_result("# Fallback\nContent"),
+                _make_llm_result(_VALID_FALLBACK),
             ],
         ):
             result = await synthesize_section(
@@ -128,18 +156,17 @@ class TestSynthesizeSection:
     @pytest.mark.asyncio
     async def test_strip_markdown_fences_in_output(self) -> None:
         settings = _make_settings()
-        fenced = "```markdown\n# Title\nBody\n```"
         with patch(
             "artifactor.outputs.synthesizer.guarded_llm_call",
             new_callable=AsyncMock,
-            return_value=_make_llm_result(fenced),
+            return_value=_make_llm_result(_VALID_FENCED),
         ):
             result = await synthesize_section(
                 "features", "prompt", "ctx", settings,
             )
 
         assert result is not None
-        assert result.content == "# Title\nBody"
+        assert result.content == _VALID_FENCED_STRIPPED
 
     @pytest.mark.asyncio
     async def test_empty_content_tries_next_model(self) -> None:
@@ -149,7 +176,7 @@ class TestSynthesizeSection:
             new_callable=AsyncMock,
             side_effect=[
                 _make_llm_result(""),
-                _make_llm_result("# Real Content"),
+                _make_llm_result(_VALID_CONTENT),
             ],
         ):
             result = await synthesize_section(
@@ -157,4 +184,87 @@ class TestSynthesizeSection:
             )
 
         assert result is not None
-        assert "Real Content" in result.content
+        assert "project overview" in result.content
+
+    # ── PLAN70: Validation tests ─────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_validation_failure_falls_through(
+        self,
+    ) -> None:
+        """Short content on model-a triggers validation failure,
+        model-b returns valid content."""
+        settings = _make_settings()
+        with patch(
+            "artifactor.outputs.synthesizer.guarded_llm_call",
+            new_callable=AsyncMock,
+            side_effect=[
+                _make_llm_result(_SHORT_CONTENT),
+                _make_llm_result(_VALID_CONTENT),
+            ],
+        ):
+            result = await synthesize_section(
+                "features", "prompt", "ctx", settings,
+            )
+
+        assert result is not None
+        assert "project overview" in result.content
+
+    @pytest.mark.asyncio
+    async def test_validation_failure_all_models_returns_none(
+        self,
+    ) -> None:
+        """All models return short content → None."""
+        settings = _make_settings()
+        with patch(
+            "artifactor.outputs.synthesizer.guarded_llm_call",
+            new_callable=AsyncMock,
+            return_value=_make_llm_result(_SHORT_CONTENT),
+        ):
+            result = await synthesize_section(
+                "features", "prompt", "ctx", settings,
+            )
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_valid_content_passes_unchanged(
+        self,
+    ) -> None:
+        """Content above min_length passes through with
+        whitespace stripped."""
+        settings = _make_settings()
+        padded = "  " + _VALID_CONTENT + "  \n"
+        with patch(
+            "artifactor.outputs.synthesizer.guarded_llm_call",
+            new_callable=AsyncMock,
+            return_value=_make_llm_result(padded),
+        ):
+            result = await synthesize_section(
+                "features", "prompt", "ctx", settings,
+            )
+
+        assert result is not None
+        assert result.content == _VALID_CONTENT.strip()
+
+    @pytest.mark.asyncio
+    async def test_validation_failure_logs_event(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Validation failure emits structured log."""
+        settings = _make_settings()
+        with caplog.at_level(
+            logging.WARNING
+        ), patch(
+            "artifactor.outputs.synthesizer.guarded_llm_call",
+            new_callable=AsyncMock,
+            return_value=_make_llm_result(_SHORT_CONTENT),
+        ):
+            await synthesize_section(
+                "features", "prompt", "ctx", settings,
+            )
+
+        assert any(
+            "synthesis_validation_failed" in r.message
+            for r in caplog.records
+        )

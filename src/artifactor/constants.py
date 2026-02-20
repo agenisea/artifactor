@@ -91,6 +91,24 @@ class ExportFormat(StrEnum):
     PDF = "pdf"
 
 
+class SectionName(StrEnum):
+    """Canonical section identifiers for document generation."""
+
+    EXECUTIVE_OVERVIEW = "executive_overview"
+    FEATURES = "features"
+    PERSONAS = "personas"
+    USER_STORIES = "user_stories"
+    SECURITY_REQUIREMENTS = "security_requirements"
+    SYSTEM_OVERVIEW = "system_overview"
+    DATA_MODELS = "data_models"
+    INTERFACES = "interfaces"
+    UI_SPECS = "ui_specs"
+    API_SPECS = "api_specs"
+    INTEGRATIONS = "integrations"
+    TECH_STORIES = "tech_stories"
+    SECURITY_CONSIDERATIONS = "security_considerations"
+
+
 # Type alias for analysis source provenance
 type AnalysisSource = Literal["ast", "llm", "cross_validated"]
 
@@ -208,10 +226,20 @@ ARCH_DIAGRAM_MAX_RELATIONSHIPS = 50
 ARCH_DIAGRAM_MAX_ENTITIES = 20
 SEQUENCE_DIAGRAM_MAX_CALLS = 30
 
-# ── Call Graph Depth ────────────────────────────────────
+# ── Intent Router ──────────────────────────────────────
+
+SEARCH_PRIORITY_WEIGHT = 1.5
+
+# ── Call Graph ─────────────────────────────────────────
 
 CALL_GRAPH_MIN_DEPTH = 1
 CALL_GRAPH_MAX_DEPTH = 5
+CALL_GRAPH_DEFAULT_DEPTH = 2
+CALL_GRAPH_DEFAULT_DIRECTION = "both"
+
+# ── Section Validation ─────────────────────────────────
+
+SECTION_MIN_LENGTH = 50
 
 # ── Stage Labels (user-facing) ─────────────────────────
 

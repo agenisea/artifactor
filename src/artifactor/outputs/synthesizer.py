@@ -11,10 +11,15 @@ import re
 from dataclasses import dataclass
 
 from circuitbreaker import CircuitBreakerError
+from pydantic import ValidationError
 
 from artifactor.analysis.llm import LLMCallResult, guarded_llm_call
 from artifactor.config import Settings
-from artifactor.constants import Confidence
+from artifactor.constants import (
+    ERROR_TRUNCATION_CHARS,
+    Confidence,
+)
+from artifactor.outputs.synthesis_models import SectionMarkdown
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +57,8 @@ async def synthesize_section(
     """Call LLM to generate section markdown.
 
     Tries each model in settings.litellm_model_chain.
-    Returns None if all models fail (circuit breaker, timeout, etc.).
+    Returns None if all models fail (circuit breaker, timeout,
+    validation failure, etc.).
     """
     messages: list[dict[str, str]] = [
         {"role": "system", "content": system_prompt},
@@ -68,13 +74,23 @@ async def synthesize_section(
                 json_mode=False,
             )
             content = _strip_fences(result.content)
-            if not content:
+
+            # Validate content structure before accepting.
+            # On failure, try next model in chain (same as old
+            # empty-content path). SectionMarkdown strips
+            # whitespace and enforces min_length.
+            try:
+                validated = SectionMarkdown(content=content)
+                content = validated.content
+            except ValidationError as ve:
                 logger.warning(
-                    "event=synthesis_empty section=%s model=%s",
+                    "event=synthesis_validation_failed"
+                    " section=%s model=%s error=%s",
                     section_name,
                     model_name,
+                    str(ve)[:ERROR_TRUNCATION_CHARS],
                 )
-                continue
+                continue  # try next model in chain
 
             return SynthesisResult(
                 content=content,

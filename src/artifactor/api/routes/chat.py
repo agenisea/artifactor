@@ -17,6 +17,9 @@ from sse_starlette.sse import EventSourceResponse
 
 from artifactor.agent.agent import create_agent
 from artifactor.agent.deps import AgentDeps
+from artifactor.agent.router import ChatIntent, classify_intent
+from artifactor.agent.schemas import AgentResponse
+from artifactor.agent.specialists import agent_for_intent
 from artifactor.api.dependencies import Repos, get_repos
 from artifactor.api.schemas import ChatRequest
 from artifactor.chat.rag_pipeline import retrieve_context
@@ -75,6 +78,186 @@ def _tool_status_message(
         return f"Running {tool_name}..."
 
 
+# ── Streaming helper (reusable for specialist + fallback) ───
+
+
+async def _stream_agent_run(
+    agent: Agent[AgentDeps, AgentResponse],
+    user_prompt: str,
+    deps: AgentDeps,
+    request_id: str,
+    conversation_id: str,
+    metadata: dict[str, Any] | None = None,
+) -> AsyncIterator[dict[str, str]]:
+    """Yield SSE events from an agent run.
+
+    Reused for both the specialist attempt and the general fallback.
+    Contains the agent.iter() loop, tool call event extraction,
+    model name tracking, and the final complete event.
+
+    Args:
+        agent: The pydantic-ai agent to run.
+        user_prompt: The user's message (with RAG context prepended).
+        deps: Agent dependencies (repos, logger, etc.).
+        request_id: Unique request identifier for SSE correlation.
+        conversation_id: Conversation thread ID for frontend threading.
+            Passed through to the complete event unchanged.
+        metadata: Optional mutable dict — caller passes {} to collect
+            model_name, tools_called, tokens after the generator completes.
+    """
+    model_name = "unknown"
+    tools_called: list[str] = []
+
+    async with agent.iter(user_prompt, deps=deps) as agent_run:
+        async for node in agent_run:
+            if Agent.is_call_tools_node(node):
+                resp = node.model_response
+                if resp.model_name:
+                    model_name = resp.model_name
+                for part in resp.parts:
+                    if isinstance(part, ToolCallPart):
+                        tools_called.append(part.tool_name)
+                        args = (
+                            part.args
+                            if isinstance(
+                                part.args, (dict, str)
+                            )
+                            else None
+                        )
+                        yield {
+                            "event": SSEEvent.TOOL_CALL,
+                            "data": json.dumps({
+                                "tool": part.tool_name,
+                                "message": _tool_status_message(
+                                    part.tool_name, args
+                                ),
+                                "request_id": request_id,
+                            }),
+                        }
+
+    if agent_run.result is None:
+        raise RuntimeError("Agent returned no result")
+
+    agent_response = agent_run.result.output
+    usage = agent_run.result.usage()
+
+    # Populate metadata for caller logging
+    if metadata is not None:
+        metadata["model_name"] = model_name
+        metadata["tools_called"] = tools_called
+        metadata["tokens"] = (
+            (usage.input_tokens or 0)
+            + (usage.output_tokens or 0)
+        )
+
+    yield {
+        "event": SSEEvent.COMPLETE,
+        "data": json.dumps({
+            "message": agent_response.message,
+            "citations": [
+                c.model_dump()
+                for c in agent_response.citations
+            ],
+            "confidence": (
+                agent_response.confidence.model_dump()
+                if agent_response.confidence
+                else None
+            ),
+            "tools_used": tools_called
+            or agent_response.tools_used,
+            "conversation_id": conversation_id,
+            "request_id": request_id,
+            "model": model_name,
+            "tokens": (usage.input_tokens or 0)
+            + (usage.output_tokens or 0),
+        }),
+    }
+
+
+# ── Extracted helpers ─────────────────────────────────
+
+
+async def _build_rag_prompt(
+    message: str,
+    project_id: str,
+    repos: Repos,
+    settings: Any,
+) -> str:
+    """Retrieve RAG context and build the augmented user prompt.
+
+    Returns the original message if retrieval fails.
+    """
+    try:
+        context = await retrieve_context(
+            query=message,
+            project_id=project_id,
+            entity_repo=repos.entity,
+            document_repo=repos.document,
+            settings=settings,
+        )
+    except Exception:
+        logger.warning(
+            "event=rag_retrieval_failed", exc_info=True
+        )
+        return message
+
+    if context and context.formatted:
+        return (
+            f"Context:\n{context.formatted}\n\n"
+            f"Question: {message}"
+        )
+    return message
+
+
+def _error_to_sse_event(
+    exc: Exception,
+    request_id: str,
+) -> dict[str, str]:
+    """Map an exception to a sanitized SSE error event."""
+    error_class = classify_error(exc)
+    logger.warning(
+        "event=chat_error class=%s"
+        " retryable=%s error=%s"
+        " request_id=%s",
+        error_class.value,
+        error_class
+        in (
+            ErrorClass.TRANSIENT,
+            ErrorClass.SERVER,
+            ErrorClass.TIMEOUT,
+        ),
+        str(exc)[:ERROR_TRUNCATION_CHARS],
+        request_id,
+    )
+    if error_class == ErrorClass.TIMEOUT:
+        msg = (
+            "Chat response timed out."
+            " Please try a simpler question."
+        )
+        cls = "timeout"
+    elif error_class == ErrorClass.CLIENT:
+        msg = (
+            "Chat request failed"
+            " due to a configuration error."
+        )
+        cls = "client"
+    else:
+        msg = "Chat request failed. Please try again."
+        cls = error_class.value
+
+    return {
+        "event": SSEEvent.ERROR,
+        "data": json.dumps({
+            "error": msg,
+            "request_id": request_id,
+            "error_class": cls,
+        }),
+    }
+
+
+# ── Main chat event stream ────────────────────────────
+
+
 async def _chat_event_stream(
     request: Request,
     project_id: str,
@@ -83,8 +266,9 @@ async def _chat_event_stream(
 ) -> AsyncIterator[dict[str, str]]:
     """Async generator that yields SSE events for a chat turn.
 
-    Uses agent.iter() for real-time tool call streaming with
-    human-friendly status messages and model name tracking.
+    Uses intent routing to dispatch to specialized agents with
+    focused prompts and tool subsets. Falls back to the general
+    agent if a specialist fails.
     """
     settings = request.app.state.settings
     request_id = uuid.uuid4().hex[:ID_HEX_LENGTH]
@@ -113,189 +297,99 @@ async def _chat_event_stream(
         ),
     }
 
-    # 2. Retrieve RAG context
-    try:
-        context = await retrieve_context(
-            query=body.message,
-            project_id=project_id,
-            entity_repo=repos.entity,
-            document_repo=repos.document,
-            settings=settings,
-        )
-    except Exception:
-        logger.warning("event=rag_retrieval_failed", exc_info=True)
-        context = None
+    # 2. Retrieve RAG context + build prompt
+    user_prompt = await _build_rag_prompt(
+        body.message, project_id, repos, settings
+    )
 
-    # 3. Build prompt with context
-    user_prompt = body.message
-    if context and context.formatted:
-        user_prompt = (
-            f"Context:\n{context.formatted}\n\n"
-            f"Question: {body.message}"
-        )
+    # 3. Classify intent and select agent
+    agent_model = getattr(
+        request.app.state, "agent_model", None
+    )
+    intent = classify_intent(body.message)
+    agent = agent_for_intent(intent, agent_model)
+    conversation_id = body.conversation_id or request_id
 
-    # 4. Run agent with iter() for streaming
     yield {
         "event": SSEEvent.THINKING,
-        "data": json.dumps(
-            {
-                "status": "Generating response...",
-                "request_id": request_id,
-            }
-        ),
+        "data": json.dumps({
+            "status": f"Routing to {intent.value} agent...",
+            "request_id": request_id,
+            "intent": intent.value,
+        }),
     }
 
+    start = time.monotonic()
+
     try:
-        agent_model = getattr(
-            request.app.state, "agent_model", None
-        )
-        agent = create_agent(model=agent_model)
-
-        model_name = "unknown"
-        tools_called: list[str] = []
-        start = time.monotonic()
-
+        # Single timeout wraps BOTH specialist + fallback
         async with asyncio.timeout(
             TIMEOUTS["chat_agent"]
         ):
-            async with agent.iter(
-                user_prompt, deps=deps
-            ) as agent_run:
-                async for node in agent_run:
-                    if Agent.is_call_tools_node(node):
-                        resp = node.model_response
-                        if resp.model_name:
-                            model_name = resp.model_name
-                        for part in resp.parts:
-                            if isinstance(
-                                part, ToolCallPart
-                            ):
-                                tools_called.append(
-                                    part.tool_name
-                                )
-                                args = (
-                                    part.args
-                                    if isinstance(
-                                        part.args,
-                                        (dict, str),
-                                    )
-                                    else None
-                                )
-                                msg = (
-                                    _tool_status_message(
-                                        part.tool_name,
-                                        args,
-                                    )
-                                )
-                                yield {
-                                    "event": SSEEvent.TOOL_CALL,
-                                    "data": json.dumps(
-                                        {
-                                            "tool": part.tool_name,
-                                            "message": msg,
-                                            "request_id": request_id,
-                                        }
-                                    ),
-                                }
+            run_meta: dict[str, Any] = {}
+            try:
+                async for event in _stream_agent_run(
+                    agent,
+                    user_prompt,
+                    deps,
+                    request_id,
+                    conversation_id,
+                    run_meta,
+                ):
+                    yield event
+            except Exception as exc:
+                if intent != ChatIntent.GENERAL:
+                    logger.warning(
+                        "event=specialist_fallback"
+                        " intent=%s error=%s",
+                        intent.value,
+                        str(exc)[
+                            :ERROR_TRUNCATION_CHARS
+                        ],
+                    )
+                    yield {
+                        "event": SSEEvent.THINKING,
+                        "data": json.dumps({
+                            "status": "Retrying with"
+                            " general agent...",
+                            "request_id": request_id,
+                            "intent": ChatIntent.GENERAL,
+                        }),
+                    }
+                    general_agent = create_agent(
+                        model=agent_model
+                    )
+                    run_meta = {}
+                    async for event in _stream_agent_run(
+                        general_agent,
+                        user_prompt,
+                        deps,
+                        request_id,
+                        conversation_id,
+                        run_meta,
+                    ):
+                        yield event
+                else:
+                    raise
 
+        # SUCCESS PATH ONLY — log_request() not called on errors
         duration_ms = int(
             (time.monotonic() - start) * 1000
         )
-
-        if agent_run.result is None:
-            raise RuntimeError("Agent returned no result")
-        agent_response = agent_run.result.output
-
-        # Log the completed request
-        usage = agent_run.result.usage()
         agent_logger.log_request(
             request_id=request_id,
             query=body.message,
-            model=model_name,
-            tokens=(usage.input_tokens or 0)
-            + (usage.output_tokens or 0),
-            tools_called=tools_called,
-            duration_ms=duration_ms,
-        )
-
-        # 5. Yield complete event
-        response_data: dict[str, Any] = {
-            "message": agent_response.message,
-            "citations": [
-                c.model_dump()
-                for c in agent_response.citations
-            ],
-            "confidence": (
-                agent_response.confidence.model_dump()
-                if agent_response.confidence
-                else None
+            model=run_meta.get("model_name", "unknown"),
+            tokens=run_meta.get("tokens", 0),
+            tools_called=run_meta.get(
+                "tools_called", []
             ),
-            "tools_used": tools_called
-            or agent_response.tools_used,
-            "conversation_id": body.conversation_id
-            or request_id,
-            "request_id": request_id,
-            "model": model_name,
-        }
-        yield {
-            "event": SSEEvent.COMPLETE,
-            "data": json.dumps(response_data),
-        }
+            duration_ms=duration_ms,
+            intent=intent.value,
+        )
 
     except Exception as exc:
-        error_class = classify_error(exc)
-        logger.warning(
-            "event=chat_error class=%s"
-            " retryable=%s error=%s"
-            " request_id=%s",
-            error_class.value,
-            error_class
-            in (
-                ErrorClass.TRANSIENT,
-                ErrorClass.SERVER,
-                ErrorClass.TIMEOUT,
-            ),
-            str(exc)[:ERROR_TRUNCATION_CHARS],
-            request_id,
-        )
-        if error_class == ErrorClass.TIMEOUT:
-            yield {
-                "event": SSEEvent.ERROR,
-                "data": json.dumps(
-                    {
-                        "error": "Chat response timed"
-                        " out. Please try a simpler"
-                        " question.",
-                        "request_id": request_id,
-                        "error_class": "timeout",
-                    }
-                ),
-            }
-        elif error_class == ErrorClass.CLIENT:
-            yield {
-                "event": SSEEvent.ERROR,
-                "data": json.dumps(
-                    {
-                        "error": "Chat request failed"
-                        " due to a configuration"
-                        " error.",
-                        "request_id": request_id,
-                        "error_class": "client",
-                    }
-                ),
-            }
-        else:
-            yield {
-                "event": SSEEvent.ERROR,
-                "data": json.dumps(
-                    {
-                        "error": "Chat request failed."
-                        " Please try again.",
-                        "request_id": request_id,
-                        "error_class": error_class.value,
-                    }
-                ),
-            }
+        yield _error_to_sse_event(exc, request_id)
 
 
 @router.post("/chat")
@@ -307,6 +401,8 @@ async def chat(
 ) -> EventSourceResponse:
     """RAG-backed chat with SSE streaming."""
     return EventSourceResponse(
-        _chat_event_stream(request, project_id, body, repos),
+        _chat_event_stream(
+            request, project_id, body, repos
+        ),
         sep="\n",
     )

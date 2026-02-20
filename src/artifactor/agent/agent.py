@@ -12,30 +12,31 @@ from artifactor.agent.tools import register_tools
 from artifactor.prompts import CHAT_AGENT_PROMPT
 
 
+def resolve_model(model: Any = None) -> Any:
+    """Resolve a pydantic-ai model from Settings if None.
+
+    Builds a FallbackModel for multi-model chains, or returns
+    the single model directly. Pass a TestModel for testing.
+    """
+    if model is not None:
+        return model
+    from artifactor.config import Settings
+
+    settings = Settings()
+    models = settings.pydantic_ai_models
+    if len(models) > 1:
+        from pydantic_ai.models.fallback import FallbackModel
+
+        return FallbackModel(*models)
+    return models[0]
+
+
 def create_agent(
     model: Any = None,
 ) -> Agent[AgentDeps, AgentResponse]:
-    """Create the chat agent with fallback model chain.
-
-    If *model* is ``None``, builds a FallbackModel from
-    ``Settings.litellm_model_chain``.  Single-model chains
-    skip the FallbackModel wrapper.
-    Pass a ``TestModel`` instance for deterministic testing.
-    """
-    if model is None:
-        from artifactor.config import Settings
-
-        settings = Settings()
-        models = settings.pydantic_ai_models
-        if len(models) > 1:
-            from pydantic_ai.models.fallback import FallbackModel
-
-            model = FallbackModel(*models)
-        else:
-            model = models[0]
-
+    """Create the general chat agent with all 10 tools."""
     agent: Agent[AgentDeps, AgentResponse] = Agent(
-        model,
+        resolve_model(model),
         output_type=AgentResponse,
         instructions=CHAT_AGENT_PROMPT,
         deps_type=AgentDeps,

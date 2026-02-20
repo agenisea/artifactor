@@ -33,6 +33,7 @@ class AgentLogger:
         tokens: int,
         tools_called: list[str],
         duration_ms: float,
+        intent: str = "",
     ) -> None:
         self._logger.info(
             json.dumps({
@@ -44,6 +45,7 @@ class AgentLogger:
                 "tokens": tokens,
                 "tools_called": tools_called,
                 "duration_ms": duration_ms,
+                "intent": intent,
             })
         )
 

@@ -44,6 +44,65 @@ Uses LLM synthesis with template fallback. Each of the 13 section generators col
 
 ## Architecture
 
+```
+                              ┌─────────────────┐
+                              │   Source Code   │
+                              │   Repository    │
+                              └────────┬────────┘
+                                       │
+                              ┌────────▼─────────┐
+                              │    Ingestion     │
+                              │  git · chunker · │
+                              │  lang detector   │
+                              └───────┬┬─────────┘
+                         ┌────────────┘└────────────┐
+                         ▼                          ▼
+               ┌─────────────────┐       ┌───────────────────┐
+               │ Static Analysis │       │  LLM Inference    │
+               │   (tree-sitter) │       │    (litellm)      │
+               │                 │       │                   │
+               │ AST · call graph│       │ narration · rules │
+               │ deps · schemas  │       │ risks · entities  │
+               │ API endpoints   │       │                   │
+               └────────┬────────┘       └───────┬───────────┘
+                        └────────┬┬──────────────┘
+                                 ││
+                        ┌────────▼▼─────────┐
+                        │ Cross-Validation  │
+                        │  token matching · │
+                        │ confidence scorer │
+                        │ citation verifier │
+                        └────────┬──────────┘
+                                 │
+                     ┌───────────▼───────────┐
+                     │  Intelligence Model   │
+                     │                       │
+                     │  KnowledgeGraph       │
+                     │  (entities, relations)│
+                     │  ReasoningGraph       │
+                     │  (rules, workflows)   │
+                     └──┬──────┬──────┬───┬──┘
+                        │      │      │   │
+          ┌─────────────┘      │      │   └────────────┐
+          ▼                    ▼      ▼                ▼
+  ┌───────────────┐  ┌───────────┐  ┌────────┐   ┌──────────────┐
+  │ 13 Section    │  │ Chat/RAG  │  │  REST  │   │  MCP Server  │
+  │ Generators    │  │ Pipeline  │  │  API   │   │  10 tools    │
+  │               │  │           │  │  30    │   │  5 resources │
+  │ LLM synthesis │  │ intent    │  │ routes │   │  5 prompts   │
+  │ + template    │  │ router    │  │  SSE   │   │              │
+  │   fallback    │  │    │      │  │        │   │  stdio / SSE │
+  └───────┬───────┘  │    ▼      │  └────────┘   └──────────────┘
+          │          │ specialist│
+          ▼          │  agents   │
+  ┌───────────────┐  │ (lookup,  │
+  │    Export     │  │  code,    │
+  │ MD·HTML·PDF·  │  │  search,  │
+  │    JSON       │  │  general) │
+  └───────────────┘  │ RAG+RRF   │
+                     └───────────┘
+```
+
 ### Design Axioms
 
 1. **Understanding > Action** — reads code, never writes or executes it
@@ -61,8 +120,9 @@ Uses LLM synthesis with template fallback. Each of the 13 section generators col
 - **SSE streaming** — `sse-starlette`, `sse-kit` for analysis progress and chat responses
 - **RAG pipeline** — Hybrid vector (LanceDB) + keyword (SQLite FTS) search, merged via Reciprocal Rank Fusion (RRF)
 - **Citation guardrails** — Every generated claim cites source code; citations verified against the source tree in the pipeline
+- **Intent-based agent routing** — Chat classifies user intent (lookup, code exploration, search, general) and dispatches to a specialist agent with only the relevant tool subset, reducing token waste and improving response quality
 
-The codebase is 139 Python source files with strict Pyright type checking, protocol-based repositories (no inheritance), frozen value objects, and a typed pipeline architecture with semaphore-bounded concurrency.
+The codebase is 145 Python source files with strict Pyright type checking, protocol-based repositories (no inheritance), frozen value objects, and a typed pipeline architecture with semaphore-bounded concurrency.
 
 ---
 
@@ -135,6 +195,8 @@ Add to `~/.claude/mcp.json`:
 
 **Docker (SSE) — for remote or containerized access:**
 
+> **Note:** `--host 0.0.0.0` binds to all interfaces. For local non-container use, prefer `--host 127.0.0.1` to avoid exposing the server on your network.
+
 ```bash
 artifactor mcp --transport sse --host 0.0.0.0 --port 8001
 ```
@@ -170,7 +232,7 @@ POST /api/projects/{id}/chat
 {"message": "How does authentication work in this system?"}
 ```
 
-The chat retrieves context via vector search (LanceDB) and keyword search (SQLite FTS), merges results using Reciprocal Rank Fusion (RRF), then generates a response with inline citations. Responses stream via SSE with thinking indicators.
+The chat classifies user intent (lookup, code exploration, search, or general) and dispatches to a specialist agent with only the relevant tools. Context is retrieved via vector search (LanceDB) and keyword search (SQLite FTS), merged using Reciprocal Rank Fusion (RRF), then the agent generates a response with inline citations. Responses stream via SSE with thinking indicators.
 
 ---
 
@@ -295,7 +357,7 @@ src/artifactor/
   chat/           RAG pipeline (hybrid vector + keyword + RRF merge), conversation management
   api/            FastAPI routes (30 endpoints), SSE streaming, auth middleware
   mcp/            MCP server (10 tools, 5 resources, 5 prompts)
-  agent/          pydantic-ai agent with tool bindings
+  agent/          pydantic-ai agents: intent router, specialist agents (lookup, code, search), shared tool logic
   playbooks/      YAML playbook loader and gallery API
   repositories/   Protocol-based data access (SQLAlchemy 2.0 async)
   models/         SQLAlchemy ORM models
@@ -341,7 +403,7 @@ cd frontend && pnpm install && pnpm dev            # Frontend (port 3000)
 Tests use demo API keys (`"for-demo-purposes-only"`) — no real LLM calls.
 
 ```bash
-uv run pytest tests/ -v                            # 619 tests
+uv run pytest tests/ -v                            # 696+ tests
 uv run ruff check src/ tests/                      # Linting
 uv run pyright src/                                # Type checking
 cd frontend && tsc --noEmit                        # Frontend type checking
@@ -439,7 +501,7 @@ curl http://localhost:8000/api/health
 - **Pluggable LLM** — any [litellm-supported provider](https://docs.litellm.ai/) works: OpenAI, Anthropic, Google, Azure, local Ollama. No vendor lock-in.
 - **Verified citations** — every claim cites the exact file, function, and line. Dual-path cross-validation (AST + LLM) catches what either path alone would miss.
 - **Honest confidence** — every finding carries a confidence score. Low-confidence claims are flagged, not hidden. Artifactor tells you what it doesn't know.
-- **Engineering rigor** — 619+ tests across a 4-tier test pyramid, strict type checking, protocol-based architecture, frozen value objects.
+- **Engineering rigor** — 696+ tests across a 4-tier test pyramid, strict type checking, protocol-based architecture, frozen value objects.
 
 ---
 

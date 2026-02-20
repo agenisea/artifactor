@@ -10,6 +10,8 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 from pydantic_ai.models.test import TestModel
 
+from artifactor.agent.agent import create_agent
+from artifactor.api.routes.chat import TOOL_STATUS_TEMPLATES
 from artifactor.constants import SSEEvent
 from artifactor.main import app
 from tests.conftest import (
@@ -209,7 +211,7 @@ class TestChatSSE:
             "artifactor.api.routes.chat.TIMEOUTS",
             {"chat_agent": 0.01},
         ), patch(
-            "artifactor.api.routes.chat.create_agent",
+            "artifactor.api.routes.chat.agent_for_intent",
         ) as mock_create:
             mock_agent = AsyncMock()
             mock_agent.iter = _hanging_iter
@@ -227,3 +229,15 @@ class TestChatSSE:
         assert len(error_events) >= 1
         data = json.loads(error_events[0]["data"])
         assert "timed out" in data["error"]
+
+
+class TestToolStatusTemplateDrift:
+    def test_templates_match_registered_tools(self) -> None:
+        """Every TOOL_STATUS_TEMPLATES key must be a registered tool."""
+        agent = create_agent(model=TestModel())
+        toolset = agent._function_toolset  # pyright: ignore[reportPrivateUsage]
+        tool_names = set(toolset.tools.keys())
+        for name in TOOL_STATUS_TEMPLATES:
+            assert name in tool_names, (
+                f"Template for unknown tool: {name}"
+            )

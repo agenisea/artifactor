@@ -18,7 +18,7 @@ A structured knowledge graph and reasoning graph built from dual-path analysis (
 
 ### Agent Integration
 
-An MCP server (10 tools, 5 prompts) that feeds your Intelligence Model to AI coding agents — Claude, Cursor, Copilot, or any MCP-compatible tool. A REST API (30 endpoints) for programmatic access. Five built-in playbooks for guided workflows: code review, bug diagnosis, test generation, migration planning, and repo onboarding.
+An MCP server (10 tools, 5 prompts) that feeds your Intelligence Model to AI coding agents — Claude, Cursor, Copilot, or any MCP-compatible tool. A REST API (30 endpoints) for programmatic access. Intent-based chat routing dispatches to specialist agents (lookup, code exploration, search) with only the relevant tools. Five built-in playbooks for guided workflows: code review, bug diagnosis, test generation, migration planning, and repo onboarding.
 
 ### Documentation
 
@@ -96,7 +96,7 @@ For comprehensive technical documentation, see **[ARTIFACTOR.md](ARTIFACTOR.md)*
 - **Pluggable LLM** — any [litellm-supported provider](https://docs.litellm.ai/) works: OpenAI, Anthropic, Google, Azure, local Ollama. No vendor lock-in.
 - **Verified citations** — every claim cites the exact file, function, and line. Dual-path cross-validation (AST + LLM) catches what either path alone would miss.
 - **Honest confidence** — every finding carries a confidence score. Low-confidence claims are flagged, not hidden. Artifactor tells you what it doesn't know.
-- **Engineering rigor** — 619+ tests across a 4-tier test pyramid, strict type checking, protocol-based architecture, frozen value objects.
+- **Engineering rigor** — 696+ tests across a 4-tier test pyramid, strict type checking, protocol-based architecture, frozen value objects.
 
 ## Links
 

@@ -59,7 +59,7 @@ class TestSSEErrorSanitization:
     ) -> None:
         """Chat SSE error events must not leak exception details."""
         with patch(
-            "artifactor.api.routes.chat.create_agent"
+            "artifactor.api.routes.chat.agent_for_intent"
         ) as mock_create:
             mock_agent = MagicMock()
             # agent.iter() returns an async context manager

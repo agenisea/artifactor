@@ -5,6 +5,7 @@ from __future__ import annotations
 from artifactor.constants import (
     ARCH_DIAGRAM_MAX_ENTITIES,
     ARCH_DIAGRAM_MAX_RELATIONSHIPS,
+    CALL_GRAPH_DEFAULT_DEPTH,
     SEQUENCE_DIAGRAM_MAX_CALLS,
     RelationshipType,
 )
@@ -79,7 +80,7 @@ def generate_er_diagram(kg: KnowledgeGraph) -> str:
 def generate_call_graph_diagram(
     kg: KnowledgeGraph,
     entity_id: str | None = None,
-    depth: int = 2,
+    depth: int = CALL_GRAPH_DEFAULT_DEPTH,
 ) -> str:
     """Generate a Mermaid flowchart for call graph."""
     lines = ["flowchart LR"]

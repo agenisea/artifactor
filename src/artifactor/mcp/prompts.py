@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from fastmcp import FastMCP
 
+from artifactor.constants import SectionName
+
 
 def register_prompts(mcp: FastMCP) -> None:
     """Register all 5 MCP prompts."""
@@ -17,13 +19,13 @@ def register_prompts(mcp: FastMCP) -> None:
     ) -> str:
         """Generate a project briefing: overview + architecture + features."""
         overview = await _get_section(
-            project_id, "executive_overview"
+            project_id, SectionName.EXECUTIVE_OVERVIEW
         )
         architecture = await _get_section(
-            project_id, "system_overview"
+            project_id, SectionName.SYSTEM_OVERVIEW
         )
         features = await _get_section(
-            project_id, "features"
+            project_id, SectionName.FEATURES
         )
         return (
             f"# Project Briefing\n\n"
@@ -39,10 +41,11 @@ def register_prompts(mcp: FastMCP) -> None:
     ) -> str:
         """Code review context with business rules and security."""
         security = await _get_section(
-            project_id, "security_considerations"
+            project_id,
+            SectionName.SECURITY_CONSIDERATIONS,
         )
         system = await _get_section(
-            project_id, "system_overview"
+            project_id, SectionName.SYSTEM_OVERVIEW
         )
         return (
             f"# Code Review Context for {file_path}\n\n"
@@ -60,7 +63,7 @@ def register_prompts(mcp: FastMCP) -> None:
     ) -> str:
         """Generate BDD test specifications from user stories."""
         stories = await _get_section(
-            project_id, "user_stories"
+            project_id, SectionName.USER_STORIES
         )
         target = file_path
         if symbol_name:
@@ -80,10 +83,10 @@ def register_prompts(mcp: FastMCP) -> None:
     ) -> str:
         """Assemble context for bug fixing."""
         system = await _get_section(
-            project_id, "system_overview"
+            project_id, SectionName.SYSTEM_OVERVIEW
         )
         data_models = await _get_section(
-            project_id, "data_models"
+            project_id, SectionName.DATA_MODELS
         )
         return (
             f"# Bug Fix Context\n\n"
@@ -101,13 +104,14 @@ def register_prompts(mcp: FastMCP) -> None:
     ) -> str:
         """Generate a migration plan with risk analysis."""
         system = await _get_section(
-            project_id, "system_overview"
+            project_id, SectionName.SYSTEM_OVERVIEW
         )
         features = await _get_section(
-            project_id, "features"
+            project_id, SectionName.FEATURES
         )
         security = await _get_section(
-            project_id, "security_considerations"
+            project_id,
+            SectionName.SECURITY_CONSIDERATIONS,
         )
         return (
             f"# Migration Plan\n\n"
