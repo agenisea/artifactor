@@ -19,9 +19,9 @@ from artifactor.main import app
 from artifactor.outputs.base import SectionOutput
 from artifactor.services.analysis_service import (
     AnalysisResult,
-    StageEvent,
     StageStatus,
 )
+from artifactor.services.events import StageEvent
 from tests.conftest import (
     parse_sse_events as _parse_sse_events,
 )
@@ -61,8 +61,6 @@ async def _mock_run_analysis(
 ):
     """Mock run_analysis that emits stage events without LLM calls."""
     if on_progress:
-        from artifactor.services.analysis_service import StageEvent
-
         on_progress(StageEvent(
             name="ingestion_resolve",
             status=StageProgress.RUNNING,
@@ -268,9 +266,6 @@ class TestAnalyzeSSE:
         self, client: AsyncClient
     ) -> None:
         """Pause injects 'paused' event into SSE stream."""
-        # Set up registries for pause coordination
-        app.state.analysis_tasks = {}
-        app.state.analysis_queues = {}
 
         resp = await client.post(
             "/api/projects",

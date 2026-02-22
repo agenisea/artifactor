@@ -8,6 +8,8 @@ from typing import Annotated, Any
 
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, NoDecode
+from sqlalchemy import event
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 logger = logging.getLogger(__name__)
 
@@ -254,3 +256,30 @@ SECTION_TITLES: dict[str, str] = {
     "tech_stories": "Technical User Stories",
     "security_considerations": "Security Considerations",
 }
+
+
+def create_app_engine(
+    url: str, *, echo: bool = False
+) -> AsyncEngine:
+    """Create async SQLite engine with WAL journal mode.
+
+    Handles URL conversion (sqlite:/// → sqlite+aiosqlite:///)
+    and sets WAL mode via a pool-connect event listener so it
+    fires once per raw DBAPI connection, not per ORM session.
+    """
+    if url.startswith("sqlite:///"):
+        db_url = "sqlite+aiosqlite:///" + url[len("sqlite:///"):]
+    else:
+        db_url = url
+    engine = create_async_engine(db_url, echo=echo)
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _set_wal_mode(
+        dbapi_conn: object,
+        _connection_record: object,
+    ) -> None:
+        cursor = dbapi_conn.cursor()  # type: ignore[union-attr]
+        cursor.execute("PRAGMA journal_mode=WAL")  # pyright: ignore[reportUnknownMemberType]
+        cursor.close()  # pyright: ignore[reportUnknownMemberType]
+
+    return engine

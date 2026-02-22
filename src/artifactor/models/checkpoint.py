@@ -18,7 +18,7 @@ class AnalysisCheckpoint(Base):
     project_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("projects.id", ondelete="CASCADE")
     )
-    commit_sha: Mapped[str] = mapped_column(String(40))
+    commit_sha: Mapped[str] = mapped_column(String(40), index=True)
     chunk_hash: Mapped[str] = mapped_column(String(64))
     file_path: Mapped[str] = mapped_column(String(500))
     result_json: Mapped[str] = mapped_column(Text)

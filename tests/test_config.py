@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import pytest
 
@@ -72,3 +73,44 @@ class TestPydanticAiModels:
     def test_single_model_chain(self) -> None:
         s = Settings(litellm_model_chain=["openai/gpt-4.1-mini"])
         assert s.pydantic_ai_models == ["openai:gpt-4.1-mini"]
+
+
+class TestCreateAppEngine:
+    @pytest.mark.asyncio
+    async def test_wal_mode_set_on_connect(
+        self, tmp_path: Path,
+    ) -> None:
+        """WAL journal mode is set automatically on connection."""
+        from sqlalchemy import text
+
+        from artifactor.config import create_app_engine
+
+        db_file = tmp_path / "test.db"
+        engine = create_app_engine(f"sqlite:///{db_file}")
+
+        async with engine.connect() as conn:
+            row = await conn.execute(text("PRAGMA journal_mode"))
+            mode = row.scalar()
+
+        await engine.dispose()
+        assert mode == "wal"
+
+    @pytest.mark.asyncio
+    async def test_url_conversion(self) -> None:
+        """sqlite:/// is converted to sqlite+aiosqlite:///."""
+        from artifactor.config import create_app_engine
+
+        engine = create_app_engine("sqlite:///data/test.db")
+        assert "aiosqlite" in str(engine.url)
+        await engine.dispose()
+
+    @pytest.mark.asyncio
+    async def test_already_converted_url_passthrough(self) -> None:
+        """URLs already containing aiosqlite are not double-converted."""
+        from artifactor.config import create_app_engine
+
+        engine = create_app_engine(
+            "sqlite+aiosqlite:///:memory:"
+        )
+        assert str(engine.url) == "sqlite+aiosqlite:///:memory:"
+        await engine.dispose()

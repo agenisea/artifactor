@@ -19,16 +19,19 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+from artifactor.api.app_state import AppState
 from artifactor.api.dependencies import (
     Repos,
     get_data_service,
     get_project_service,
     get_repos,
 )
+from artifactor.api.event_bus import AnalysisEventBus
 from artifactor.config import Settings
 from artifactor.logger import AgentLogger
 from artifactor.main import app
 from artifactor.models.base import Base
+from artifactor.observability.dispatcher import TraceDispatcher
 from artifactor.repositories.fakes import (
     FakeConversationRepository,
     FakeDataService,
@@ -38,6 +41,7 @@ from artifactor.repositories.fakes import (
     FakeProjectService,
     FakeRelationshipRepository,
 )
+from artifactor.resilience.idempotency import IdempotencyGuard
 
 
 def setup_test_app(
@@ -63,15 +67,32 @@ def setup_test_app(
     )
     fake_project_service = FakeProjectService(fake_project_repo)
 
-    app.state.settings = Settings(
-        database_url="sqlite:///:memory:"
-    )
+    settings = Settings(database_url="sqlite:///:memory:")
+    app.state.settings = settings
     app.state.logger = AgentLogger(
         log_dir=Path(tmp_path / "logs"), level="WARNING"
     )
     app.state.project_service = fake_project_service
     if agent_model is not None:
         app.state.agent_model = agent_model
+
+    # Typed state for routes that use _app_state()
+    event_bus = AnalysisEventBus()
+    idempotency = IdempotencyGuard()
+    dispatcher = TraceDispatcher()
+    app.state.event_bus = event_bus
+    app.state.idempotency = idempotency
+    app.state.dispatcher = dispatcher
+    app.state.analysis_tasks = {}
+    app.state.analysis_queues = {}
+    app.state.background_tasks = set()
+    app.state.typed = AppState(
+        settings=settings,
+        session_factory=None,  # pyright: ignore[reportArgumentType]
+        event_bus=event_bus,
+        idempotency=idempotency,
+        dispatcher=dispatcher,
+    )
 
     app.dependency_overrides[get_repos] = lambda: fake_repos
     app.dependency_overrides[get_project_service] = (

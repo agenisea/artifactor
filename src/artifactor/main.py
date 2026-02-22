@@ -13,12 +13,10 @@ setup_logging()
 
 from fastapi import FastAPI  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
-from sqlalchemy import text  # noqa: E402
-from sqlalchemy.ext.asyncio import (  # noqa: E402
-    async_sessionmaker,
-    create_async_engine,
-)
+from sqlalchemy import update as sa_update  # noqa: E402
+from sqlalchemy.ext.asyncio import async_sessionmaker  # noqa: E402
 
+from artifactor.api.app_state import AppState  # noqa: E402
 from artifactor.api.event_bus import AnalysisEventBus  # noqa: E402
 from artifactor.api.middleware.auth import ApiKeyMiddleware  # noqa: E402
 from artifactor.api.routes import (  # noqa: E402
@@ -39,7 +37,7 @@ from artifactor.api.routes import (  # noqa: E402
     security,
     user_stories,
 )
-from artifactor.config import Settings  # noqa: E402
+from artifactor.config import Settings, create_app_engine  # noqa: E402
 from artifactor.constants import ProjectStatus  # noqa: E402
 from artifactor.logger import AgentLogger  # noqa: E402
 from artifactor.logging_config import (  # noqa: E402
@@ -64,31 +62,36 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # 1. Use module-level settings (single source of truth)
     settings = _settings
 
-    # 2. Create async SQLite engine
-    db_url = settings.database_url.replace(
-        "sqlite:///", "sqlite+aiosqlite:///"
+    # 2. Create async SQLite engine (WAL set via pool-connect listener)
+    engine = create_app_engine(
+        settings.database_url, echo=settings.debug_mode
     )
-    engine = create_async_engine(db_url, echo=settings.debug_mode)
 
     # 3. Create tables + recover stuck analyses
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        await conn.execute(text("PRAGMA journal_mode=WAL"))
         # Recover stuck analyses on startup.
         # event_bus and analysis_tasks are in-memory and non-persistent.
-        # Recovery SQL handles stale DB statuses left by prior crashes.
+        # Recovery ORM query handles stale DB statuses left by prior crashes.
+        from datetime import UTC, datetime, timedelta
+
+        from artifactor.models.project import Project
+
+        cutoff = datetime.now(UTC) - timedelta(
+            seconds=settings.analysis_timeout_seconds
+        )
         result = await conn.execute(
-            text(
-                "UPDATE projects SET status=:error"
-                " WHERE status IN (:analyzing, :paused)"
-                " AND updated_at < datetime('now', :timeout)"
-            ),
-            {
-                "error": ProjectStatus.ERROR,
-                "analyzing": ProjectStatus.ANALYZING,
-                "paused": ProjectStatus.PAUSED,
-                "timeout": f"-{settings.analysis_timeout_seconds} seconds",
-            },
+            sa_update(Project)
+            .where(
+                Project.status.in_(
+                    [
+                        ProjectStatus.ANALYZING,
+                        ProjectStatus.PAUSED,
+                    ]
+                ),
+                Project.updated_at < cutoff,
+            )
+            .values(status=ProjectStatus.ERROR)
         )
         if result.rowcount:
             _logger.warning(
@@ -125,6 +128,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.analysis_queues = analysis_queues
     bg_tasks: set[asyncio.Task[None]] = set()
     app.state.background_tasks = bg_tasks
+
+    # Typed state for projects.py (replaces getattr access)
+    app.state.typed = AppState(
+        settings=settings,
+        session_factory=session_factory,
+        event_bus=app.state.event_bus,
+        idempotency=app.state.idempotency,
+        dispatcher=dispatcher,
+        analysis_tasks=analysis_tasks,
+        analysis_queues=analysis_queues,
+        background_tasks=bg_tasks,
+    )
 
     # 9. Security: warn if auth is disabled
     if not settings.api_key:

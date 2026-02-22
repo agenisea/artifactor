@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 
 from fastapi import APIRouter, Depends, Request
-from sqlalchemy import update as sa_update
 from sse_starlette.sse import EventSourceResponse
 
+from artifactor.api.app_state import AppState
 from artifactor.api.dependencies import (
     get_project_service,
 )
@@ -21,20 +22,230 @@ from artifactor.constants import (
     ProjectStatus,
     SSEEvent,
 )
-from artifactor.models.project import Project
-from artifactor.resilience.idempotency import (
-    IdempotencyGuard,
-)
 from artifactor.services.analysis_service import (
     AnalysisResult,
-    StageEvent,
     run_analysis,
 )
+from artifactor.services.events import StageEvent
 from artifactor.services.project_service import ProjectService
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
+
+
+def _app_state(request: Request) -> AppState:
+    """Typed accessor for application state."""
+    state: AppState = request.app.state.typed
+    return state
+
+
+async def _cas_set_status(
+    service: ProjectService,
+    project_id: str,
+    new_status: str,
+) -> None:
+    """CAS status update: only overwrite if still ANALYZING.
+
+    Delegates to ProjectService.try_set_status_immediate which owns
+    the short-lived session + CAS pattern.
+    """
+    try:
+        await service.try_set_status_immediate(
+            project_id,
+            {ProjectStatus.ANALYZING},
+            new_status,
+        )
+    except Exception:
+        logger.exception(
+            "event=done_callback_failed project_id=%s",
+            project_id,
+        )
+
+
+# -- SSE event builders --
+
+
+def _error_event(message: str) -> dict[str, str]:
+    """Build an SSE error event dict."""
+    return {
+        "event": SSEEvent.ERROR,
+        "data": json.dumps({"error": message}),
+    }
+
+
+def _stage_event(event: StageEvent) -> dict[str, str]:
+    """Build an SSE stage event dict from a StageEvent."""
+    payload: dict[str, object] = {
+        "name": event.name,
+        "label": event.label,
+        "status": event.status,
+        "message": event.message,
+        "duration_ms": event.duration_ms,
+    }
+    if event.completed is not None:
+        payload["completed"] = event.completed
+        payload["total"] = event.total
+        payload["percent"] = event.percent
+    return {
+        "event": SSEEvent.STAGE,
+        "data": json.dumps(payload),
+    }
+
+
+def _complete_event(
+    project_id: str,
+    result: AnalysisResult,
+) -> dict[str, str]:
+    """Build an SSE complete event dict."""
+    return {
+        "event": SSEEvent.COMPLETE,
+        "data": json.dumps(
+            {
+                "project_id": project_id,
+                "sections": len(result.sections),
+                "stages_ok": sum(
+                    1 for s in result.stages if s.ok
+                ),
+                "stages_failed": sum(
+                    1
+                    for s in result.stages
+                    if not s.ok
+                ),
+                "partial": any(
+                    not s.ok for s in result.stages
+                ),
+                "duration_ms": result.total_duration_ms,
+            }
+        ),
+    }
+
+
+def _paused_event() -> dict[str, str]:
+    """Build an SSE paused event dict."""
+    return {
+        "event": SSEEvent.PAUSED,
+        "data": json.dumps({"message": "Analysis paused"}),
+    }
+
+
+# -- Stream helpers --
+
+
+async def _late_joiner_stream(
+    event_bus: AnalysisEventBus,
+    project_id: str,
+) -> AsyncIterator[dict[str, str]]:
+    """Subscribe to an existing analysis channel and yield events."""
+    queue = await event_bus.subscribe(project_id)
+    while True:
+        event = await queue.get()
+        if event is None:
+            break
+        yield event
+
+
+async def _drain_events(
+    event_queue: asyncio.Queue[dict[str, str]],
+    analysis_task: asyncio.Task[AnalysisResult],
+) -> AsyncIterator[dict[str, str]]:
+    """Drain SSE events from the queue until the task completes."""
+    while not analysis_task.done() or not event_queue.empty():
+        try:
+            event_dict = await asyncio.wait_for(
+                event_queue.get(),
+                timeout=SSE_POLL_TIMEOUT,
+            )
+            yield event_dict
+        except TimeoutError:
+            continue
+
+
+# -- Task lifecycle --
+
+
+async def _create_and_register_task(
+    state: AppState,
+    project_id: str,
+    repo_path: str,
+    branch: str,
+    on_progress: Callable[[StageEvent], None],
+) -> asyncio.Task[AnalysisResult]:
+    """Create analysis background task and register it in app state.
+
+    Wraps with IdempotencyGuard. Registers the task in
+    ``state.analysis_tasks`` and creates an event bus channel.
+    """
+
+    async def _run() -> AnalysisResult:
+        return await run_analysis(
+            repo_path=repo_path,
+            settings=state.settings,
+            branch=branch,
+            on_progress=on_progress,
+            dispatcher=state.dispatcher,
+            session_factory=state.session_factory,
+            project_id=project_id,
+        )
+
+    task = asyncio.create_task(
+        state.idempotency.execute(
+            f"analyze:{project_id}", _run
+        )
+    )
+    await state.event_bus.create_channel(project_id)
+    state.analysis_tasks[project_id] = task
+    return task
+
+
+def _on_analysis_done(
+    task: asyncio.Task[AnalysisResult],
+    *,
+    project_id: str,
+    analysis_tasks: dict[str, asyncio.Task[object]],
+    service: ProjectService | None,
+    event_bus: AnalysisEventBus,
+    bg_tasks: set[asyncio.Task[None]],
+) -> None:
+    """Safety-net callback: update status + clean up on task completion."""
+    analysis_tasks.pop(project_id, None)
+
+    # Log exception *before* the async work -- task.exception() is
+    # cheap and synchronous here, and we may never reach the async
+    # path if the event loop is shutting down.
+    exc = (
+        task.exception() if not task.cancelled() else None
+    )
+    if task.cancelled():
+        logger.warning(
+            "event=analysis_cancelled project_id=%s",
+            project_id,
+        )
+    elif exc is not None:
+        logger.error(
+            "event=analysis_exception project_id=%s",
+            project_id,
+            exc_info=exc,
+        )
+
+    async def _set_status() -> None:
+        if service is None:
+            await event_bus.complete(project_id)
+            return
+        status = (
+            ProjectStatus.ERROR
+            if task.cancelled() or exc is not None
+            else ProjectStatus.ANALYZED
+        )
+        await _cas_set_status(service, project_id, status)
+        await event_bus.complete(project_id)
+
+    t = asyncio.create_task(_set_status())
+    bg_tasks.add(t)
+    t.add_done_callback(bg_tasks.discard)
+
+
+# -- Route handlers --
 
 
 @router.get("")
@@ -110,27 +321,12 @@ async def _analyze_event_stream(
     If analysis is already running, subscribes to the existing
     event bus channel (late-joiner path) instead of failing.
     """
-    settings = request.app.state.settings
+    state = _app_state(request)
 
     project = await service.get(project_id)
     if project is None:
-        yield {
-            "event": SSEEvent.ERROR,
-            "data": json.dumps(
-                {"error": "Project not found"}
-            ),
-        }
+        yield _error_event("Project not found")
         return
-
-    event_bus: AnalysisEventBus | None = getattr(
-        request.app.state, "event_bus", None
-    )
-    analysis_tasks: dict[str, asyncio.Task[object]] | None = (
-        getattr(request.app.state, "analysis_tasks", None)
-    )
-    analysis_queues: (
-        dict[str, asyncio.Queue[dict[str, str]]] | None
-    ) = getattr(request.app.state, "analysis_queues", None)
 
     # Atomic CAS: only one analyze request can proceed.
     # PAUSED is included so "Resume" works.
@@ -145,234 +341,76 @@ async def _analyze_event_stream(
         ProjectStatus.ANALYZING,
     )
 
-    # Late-joiner path: subscribe to existing event bus channel
+    # Late-joiner path
     if not acquired:
-        if (
-            event_bus is not None
-            and event_bus.has_channel(project_id)
-        ):
-            queue = await event_bus.subscribe(project_id)
-            while True:
-                event = await queue.get()
-                if event is None:
-                    break
+        if state.event_bus.has_channel(project_id):
+            async for event in _late_joiner_stream(
+                state.event_bus, project_id
+            ):
                 yield event
             return
-        yield {
-            "event": SSEEvent.ERROR,
-            "data": json.dumps(
-                {"error": "Analysis already in progress"}
-            ),
-        }
+        yield _error_event("Analysis already in progress")
         return
 
-    # Queue-based progress: on_progress converts StageEvents to
-    # SSE dicts and publishes to event bus for late-joiners.
-    event_queue: asyncio.Queue[dict[str, str]] = asyncio.Queue()
+    # Primary path: setup + run
+    event_queue: asyncio.Queue[dict[str, str]] = (
+        asyncio.Queue()
+    )
 
     def on_progress(event: StageEvent) -> None:
-        payload: dict[str, object] = {
-            "name": event.name,
-            "label": event.label,
-            "status": event.status,
-            "message": event.message,
-            "duration_ms": event.duration_ms,
-        }
-        if event.completed is not None:
-            payload["completed"] = event.completed
-            payload["total"] = event.total
-            payload["percent"] = event.percent
-        event_dict: dict[str, str] = {
-            "event": SSEEvent.STAGE,
-            "data": json.dumps(payload),
-        }
+        event_dict = _stage_event(event)
         event_queue.put_nowait(event_dict)
-        if event_bus is not None:
-            event_bus.publish(project_id, event_dict)
+        state.event_bus.publish(project_id, event_dict)
 
-    # Run analysis in a background task
-    repo_path = project.local_path or ""
-    dispatcher = getattr(
-        request.app.state, "dispatcher", None
+    analysis_task = await _create_and_register_task(
+        state,
+        project_id,
+        project.local_path or "",
+        project.branch or "main",
+        on_progress,
     )
-    session_factory = getattr(
-        request.app.state, "session_factory", None
-    )
-    guard: IdempotencyGuard | None = getattr(
-        request.app.state, "idempotency", None
-    )
+    state.analysis_queues[project_id] = event_queue
 
-    async def _run() -> AnalysisResult:
-        return await run_analysis(
-            repo_path=repo_path,
-            settings=settings,
-            branch=project.branch or "main",
-            on_progress=on_progress,
-            dispatcher=dispatcher,
-            session_factory=session_factory,
+    analysis_task.add_done_callback(
+        functools.partial(
+            _on_analysis_done,
             project_id=project_id,
+            analysis_tasks=state.analysis_tasks,
+            service=service,
+            event_bus=state.event_bus,
+            bg_tasks=state.background_tasks,
         )
-
-    if guard is not None:
-        analysis_task = asyncio.create_task(
-            guard.execute(
-                f"analyze:{project_id}", _run
-            )
-        )
-    else:
-        analysis_task = asyncio.create_task(_run())
-
-    # Register task, queue, + create event bus channel
-    if event_bus is not None:
-        await event_bus.create_channel(project_id)
-    if analysis_tasks is not None:
-        analysis_tasks[project_id] = analysis_task
-    if analysis_queues is not None:
-        analysis_queues[project_id] = event_queue
-
-    # Safety net: guarantee status update even if client disconnects
-    # and the SSE generator is cancelled. Uses CAS so pause status
-    # is not overwritten. Pop from task registry
-    # synchronously to avoid stale-reference window.
-    bg_tasks: set[asyncio.Task[None]] = getattr(
-        request.app.state, "background_tasks", set()
     )
 
-    def _on_analysis_done(
-        task: asyncio.Task[AnalysisResult],
-    ) -> None:
-        # Synchronous pop from task registry
-        if analysis_tasks is not None:
-            analysis_tasks.pop(project_id, None)
+    # Drain events
+    async for event in _drain_events(
+        event_queue, analysis_task
+    ):
+        yield event
 
-        async def _set_status() -> None:
-            if session_factory is None:
-                if event_bus is not None:
-                    await event_bus.complete(project_id)
-                return
-            if task.cancelled() or task.exception() is not None:
-                # CAS: only overwrite if still ANALYZING
-                try:
-                    async with session_factory() as session:
-                        await session.execute(
-                            sa_update(Project)
-                            .where(
-                                Project.id == project_id,
-                                Project.status
-                                == ProjectStatus.ANALYZING,
-                            )
-                            .values(status=ProjectStatus.ERROR)
-                        )
-                        await session.commit()
-                except Exception:
-                    logger.exception(
-                        "event=done_callback_failed"
-                        " project_id=%s",
-                        project_id,
-                    )
-            else:
-                # CAS: only overwrite if still ANALYZING
-                try:
-                    async with session_factory() as session:
-                        await session.execute(
-                            sa_update(Project)
-                            .where(
-                                Project.id == project_id,
-                                Project.status
-                                == ProjectStatus.ANALYZING,
-                            )
-                            .values(
-                                status=ProjectStatus.ANALYZED
-                            )
-                        )
-                        await session.commit()
-                except Exception:
-                    logger.exception(
-                        "event=done_callback_failed"
-                        " project_id=%s",
-                        project_id,
-                    )
-            if event_bus is not None:
-                await event_bus.complete(project_id)
+    state.analysis_queues.pop(project_id, None)
 
-        t = asyncio.create_task(_set_status())
-        bg_tasks.add(t)
-        t.add_done_callback(bg_tasks.discard)
-
-    analysis_task.add_done_callback(_on_analysis_done)
-
-    # Drain stage events from the queue (already converted by
-    # on_progress and published to event bus for late-joiners).
-    while not analysis_task.done() or not event_queue.empty():
-        try:
-            event_dict = await asyncio.wait_for(
-                event_queue.get(),
-                timeout=SSE_POLL_TIMEOUT,
-            )
-            yield event_dict
-        except TimeoutError:
-            continue
-
-    # Clean up queue registry
-    if analysis_queues is not None:
-        analysis_queues.pop(project_id, None)
-
-    # Get the result
+    # Result
     try:
         result = await analysis_task
     except asyncio.CancelledError:
-        # Pause endpoint already published PAUSED +
-        # completed channel. _on_analysis_done handles cleanup.
         return
     except Exception:
         logger.exception(
             "event=analysis_failed project_id=%s",
             project_id,
         )
-        error_dict = {
-            "event": SSEEvent.ERROR,
-            "data": json.dumps(
-                {
-                    "error": "Analysis failed."
-                    " Check server logs for details.",
-                }
-            ),
-        }
-        # Publish before yield to avoid race with
-        # _on_analysis_done completing the channel.
-        if event_bus is not None:
-            event_bus.publish(project_id, error_dict)
-        yield error_dict
+        error = _error_event(
+            "Analysis failed."
+            " Check server logs for details."
+        )
+        state.event_bus.publish(project_id, error)
+        yield error
         return
 
-    complete_dict = {
-        "event": SSEEvent.COMPLETE,
-        "data": json.dumps(
-            {
-                "project_id": project_id,
-                "sections": len(result.sections),
-                "stages_ok": sum(
-                    1
-                    for s in result.stages
-                    if s.ok
-                ),
-                "stages_failed": sum(
-                    1
-                    for s in result.stages
-                    if not s.ok
-                ),
-                "partial": any(
-                    not s.ok for s in result.stages
-                ),
-                "duration_ms": result.total_duration_ms,
-            }
-        ),
-    }
-    # Publish before yield to avoid race with
-    # _on_analysis_done completing the channel.
-    if event_bus is not None:
-        event_bus.publish(project_id, complete_dict)
-    yield complete_dict
+    complete = _complete_event(project_id, result)
+    state.event_bus.publish(project_id, complete)
+    yield complete
 
 
 @router.post("/{project_id}/pause")
@@ -388,7 +426,6 @@ async def pause_project(
             success=False, error="Project not found"
         )
 
-    # CAS: only pause if currently ANALYZING
     acquired = await service.try_set_status_immediate(
         project_id,
         {ProjectStatus.ANALYZING},
@@ -403,40 +440,24 @@ async def pause_project(
             ),
         )
 
-    paused_event: dict[str, str] = {
-        "event": SSEEvent.PAUSED,
-        "data": json.dumps(
-            {"message": "Analysis paused"}
-        ),
-    }
+    state = _app_state(request)
+    paused = _paused_event()
 
     # Deliver paused event to original SSE connection
     # BEFORE cancelling the task (ordering matters).
-    analysis_queues: (
-        dict[str, asyncio.Queue[dict[str, str]]] | None
-    ) = getattr(request.app.state, "analysis_queues", None)
-    if analysis_queues is not None:
-        queue = analysis_queues.get(project_id)
-        if queue is not None:
-            queue.put_nowait(paused_event)
+    queue = state.analysis_queues.get(project_id)
+    if queue is not None:
+        queue.put_nowait(paused)
 
     # Cancel the running task
-    analysis_tasks: dict[str, asyncio.Task[object]] | None = (
-        getattr(request.app.state, "analysis_tasks", None)
-    )
-    if analysis_tasks is not None:
-        task = analysis_tasks.pop(project_id, None)
-        if task is not None and not task.done():
-            task.cancel()
+    task = state.analysis_tasks.pop(project_id, None)
+    if task is not None and not task.done():
+        task.cancel()
 
     # Publish PAUSED event to event bus (late-joiners)
     # + complete channel
-    event_bus: AnalysisEventBus | None = getattr(
-        request.app.state, "event_bus", None
-    )
-    if event_bus is not None:
-        event_bus.publish(project_id, paused_event)
-        await event_bus.complete(project_id)
+    state.event_bus.publish(project_id, paused)
+    await state.event_bus.complete(project_id)
 
     return APIResponse(
         success=True,
@@ -444,8 +465,47 @@ async def pause_project(
     )
 
 
+def _derive_stages(
+    events: list[dict[str, str]],
+) -> list[dict[str, object]]:
+    """Extract latest state per pipeline stage from raw SSE events.
+
+    Filters for ``event == "stage"`` entries, parses their JSON ``data``,
+    and keeps only the most recent event per stage ``name`` (last-write-wins).
+    Returns a list of stage snapshots ordered by first appearance.
+    """
+    latest: dict[str, dict[str, object]] = {}
+    order: list[str] = []
+    for ev in events:
+        if ev.get("event") != SSEEvent.STAGE:
+            continue
+        try:
+            payload: dict[str, object] = json.loads(
+                ev["data"]
+            )
+        except (json.JSONDecodeError, KeyError):
+            continue
+        name = str(payload.get("name", ""))
+        if not name:
+            continue
+        if name not in latest:
+            order.append(name)
+        latest[name] = {
+            "name": name,
+            "label": payload.get("label", ""),
+            "status": payload.get("status", ""),
+            "message": payload.get("message", ""),
+            "duration_ms": payload.get("duration_ms", 0.0),
+            "completed": payload.get("completed"),
+            "total": payload.get("total"),
+            "percent": payload.get("percent"),
+        }
+    return [latest[n] for n in order]
+
+
 @router.get("/{project_id}/status")
 async def get_analysis_status(
+    request: Request,
     project_id: str,
     service: ProjectService = Depends(get_project_service),
 ) -> APIResponse:
@@ -455,10 +515,16 @@ async def get_analysis_status(
         return APIResponse(
             success=False, error="Project not found"
         )
-    return APIResponse(
-        success=True,
-        data={
-            "project_id": project_id,
-            "status": project.status,
-        },
-    )
+    data: dict[str, object] = {
+        "project_id": project_id,
+        "status": project.status,
+    }
+    state = _app_state(request)
+    if project.status == ProjectStatus.ANALYZING:
+        raw_events = state.event_bus.get_latest_events(
+            project_id
+        )
+        stages = _derive_stages(raw_events)
+        if stages:
+            data["stages"] = stages
+    return APIResponse(success=True, data=data)

@@ -12,6 +12,7 @@ Single-process only — each worker has its own instance.
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from dataclasses import dataclass, field
 
 
@@ -19,8 +20,8 @@ from dataclasses import dataclass, field
 class _Channel:
     """Per-project event channel with replay buffer."""
 
-    events: list[dict[str, str]] = field(
-        default_factory=lambda: list[dict[str, str]](),
+    events: deque[dict[str, str]] = field(
+        default_factory=lambda: deque[dict[str, str]](),
     )
     subscribers: list[asyncio.Queue[dict[str, str] | None]] = field(
         default_factory=lambda: list[asyncio.Queue[dict[str, str] | None]](),
@@ -49,6 +50,7 @@ class AnalysisEventBus:
         """Create (or reset) a channel for *project_id*."""
         async with self._lock:
             self._channels[project_id] = _Channel(
+                events=deque(maxlen=self._max_replay),
                 max_replay=self._max_replay,
             )
 
@@ -56,16 +58,23 @@ class AnalysisEventBus:
         """Publish *event* to all current subscribers and the replay buffer.
 
         No-op if the channel does not exist (e.g. already completed).
-        Drops the oldest event when the replay buffer exceeds *max_replay*.
+        deque(maxlen=...) automatically drops the oldest event on overflow.
         """
         ch = self._channels.get(project_id)
         if ch is None:
             return
         ch.events.append(event)
-        if len(ch.events) > ch.max_replay:
-            ch.events.pop(0)
         for q in ch.subscribers:
             q.put_nowait(event)
+
+    def get_latest_events(
+        self, project_id: str
+    ) -> list[dict[str, str]]:
+        """Return a copy of the replay buffer for read-only access."""
+        ch = self._channels.get(project_id)
+        if ch is None:
+            return []
+        return list(ch.events)
 
     async def subscribe(
         self,

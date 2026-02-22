@@ -7,7 +7,7 @@ import hashlib
 import json
 import logging
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from artifactor.analysis.llm.combined import CombinedResult, analyze_chunk
 from artifactor.analysis.llm.embedder import embed_chunks
@@ -19,10 +19,8 @@ from artifactor.analysis.llm.schemas import (
 )
 from artifactor.config import Settings
 from artifactor.ingestion.schemas import ChunkedFiles, CodeChunk, LanguageMap
-
-if TYPE_CHECKING:
-    from artifactor.repositories.protocols import CheckpointRepository
-    from artifactor.services.analysis_service import StageEvent
+from artifactor.repositories.protocols import CheckpointRepository
+from artifactor.services.events import StageEvent
 
 logger = logging.getLogger(__name__)
 
@@ -69,12 +67,6 @@ async def _try_checkpoint_lookup(
     chunk_hash: str,
 ) -> CombinedResult | None:
     """Look up a cached checkpoint and deserialize it."""
-    from artifactor.analysis.llm.schemas import (
-        BusinessRule,
-        ModuleNarrative,
-        RiskIndicator,
-    )
-
     cp = await checkpoint_repo.get(project_id, chunk_hash)
     if cp is None:
         return None
@@ -191,6 +183,8 @@ async def run_llm_analysis(
 
     # Check how many are already checkpointed
     total_code = len(code_chunks)
+    # Safe: incremented between await points in cooperative asyncio.
+    # Only used for logging — no correctness dependency.
     resumed_count = 0
 
     semaphore = asyncio.Semaphore(settings.llm_max_concurrency)
@@ -219,6 +213,10 @@ async def run_llm_analysis(
                     all_rules.extend(rules)
                     all_risks.extend(risks)
                     resumed_count += 1
+                    logger.debug(
+                        "event=checkpoint_hit file=%s",
+                        chunk.file_path,
+                    )
                     completed_count += 1
                     _emit_progress(
                         on_progress,
@@ -267,13 +265,6 @@ async def run_llm_analysis(
     tasks = [
         process_chunk(chunk) for chunk in code_chunks
     ]
-
-    if resumed_count > 0:
-        logger.info(
-            "event=checkpoint_resume resumed=%d total=%d",
-            resumed_count,
-            total_code,
-        )
 
     try:
         await asyncio.wait_for(
@@ -327,7 +318,6 @@ def _emit_progress(
     if on_progress is None or total == 0:
         return
     from artifactor.constants import StageProgress
-    from artifactor.services.analysis_service import StageEvent
 
     percent = round((completed / total) * 100, 1)
     on_progress(

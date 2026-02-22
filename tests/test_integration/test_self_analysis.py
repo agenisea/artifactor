@@ -12,7 +12,8 @@ import pytest
 
 from artifactor.config import Settings
 from artifactor.constants import StageProgress
-from artifactor.services.analysis_service import StageEvent, run_analysis
+from artifactor.services.analysis_service import run_analysis
+from artifactor.services.events import StageEvent
 
 _TEST_REPO = Path(__file__).resolve().parents[1] / "fixtures" / "test_repo"
 

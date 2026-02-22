@@ -160,6 +160,48 @@ async def test_replay_capped_at_max() -> None:
 
 
 @pytest.mark.asyncio
+async def test_get_latest_events() -> None:
+    """get_latest_events returns a copy of the replay buffer."""
+    bus = AnalysisEventBus()
+    await bus.create_channel("proj-1")
+
+    bus.publish("proj-1", {"event": "stage", "data": "a"})
+    bus.publish("proj-1", {"event": "stage", "data": "b"})
+
+    events = bus.get_latest_events("proj-1")
+    assert len(events) == 2
+    assert events[0]["data"] == "a"
+    assert events[1]["data"] == "b"
+
+    # Verify it's a copy (mutating returned list doesn't affect bus)
+    events.clear()
+    assert len(bus.get_latest_events("proj-1")) == 2
+
+
+@pytest.mark.asyncio
+async def test_get_latest_events_no_channel() -> None:
+    """get_latest_events returns empty list for non-existent channel."""
+    bus = AnalysisEventBus()
+    assert bus.get_latest_events("nonexistent") == []
+
+
+@pytest.mark.asyncio
+async def test_deque_eviction() -> None:
+    """deque(maxlen=...) automatically drops oldest events."""
+    bus = AnalysisEventBus(max_replay=3)
+    await bus.create_channel("proj-1")
+
+    for i in range(5):
+        bus.publish(
+            "proj-1", {"event": "stage", "data": str(i)}
+        )
+
+    events = bus.get_latest_events("proj-1")
+    assert len(events) == 3
+    assert [e["data"] for e in events] == ["2", "3", "4"]
+
+
+@pytest.mark.asyncio
 async def test_concurrent_subscribe_and_complete() -> None:
     """Concurrent subscribe + complete does not deadlock."""
     bus = AnalysisEventBus()

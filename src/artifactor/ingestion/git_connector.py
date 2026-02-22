@@ -79,11 +79,13 @@ async def _rev_parse(repo_dir: Path) -> str:
 
 
 async def _get_commit_sha(repo_dir: Path) -> str:
-    """Try to get commit SHA; return 'unknown' if not a git repo."""
+    """Try to get commit SHA; hash directory path if not a git repo."""
     git_dir = repo_dir / ".git"
     if git_dir.exists():
         return await _rev_parse(repo_dir)
-    return "unknown"
+    import hashlib
+
+    return hashlib.sha256(str(repo_dir).encode()).hexdigest()[:40]
 
 
 def _dir_size(

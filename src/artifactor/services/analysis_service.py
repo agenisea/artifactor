@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
 from artifactor.analysis.llm.analyzer import (
     LLM_ANALYZABLE_LANGUAGES,
     run_llm_analysis,
@@ -34,7 +36,6 @@ from artifactor.analysis.static.schemas import StaticAnalysisResult
 from artifactor.config import SECTION_TITLES, Settings
 from artifactor.constants import (
     ID_HEX_LENGTH,
-    STAGE_LABELS,
     Confidence,
     StageOutcome,
     StageProgress,
@@ -60,30 +61,10 @@ from artifactor.observability.emitters import (
 from artifactor.outputs import SECTION_GENERATORS
 from artifactor.outputs.base import SectionOutput, make_degraded_section
 from artifactor.repositories.checkpoint_repo import SqlCheckpointRepository
+from artifactor.repositories.protocols import CheckpointRepository
+from artifactor.services.events import ProgressCallback, StageEvent
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class StageEvent:
-    """Typed event emitted during pipeline progress."""
-
-    name: str
-    status: StageProgress
-    message: str = ""
-    duration_ms: float = 0.0
-    # Progress fields (present during LLM chunk processing)
-    completed: int | None = None
-    total: int | None = None
-    percent: float | None = None
-
-    @property
-    def label(self) -> str:
-        """User-friendly display label from STAGE_LABELS."""
-        return STAGE_LABELS[self.name]
-
-
-type ProgressCallback = Callable[[StageEvent], None]
 
 
 @dataclass
@@ -131,10 +112,10 @@ class PipelineContext:
     settings: Settings
     branch: str = "main"
     dispatcher: TraceDispatcher | None = None
-    session_factory: Any | None = None  # async_sessionmaker
+    session_factory: async_sessionmaker[AsyncSession] | None = None
     commit_sha: str | None = None
     on_progress: ProgressCallback | None = None
-    checkpoint_repo: Any | None = None  # CheckpointRepository
+    checkpoint_repo: CheckpointRepository | None = None
 
     # Phase 1 outputs
     repo: RepoPath | None = None
@@ -157,40 +138,41 @@ class PipelineContext:
     # Phase 6 outputs
     quality_report: QualityReport | None = None
 
+    def report(self, event: StageEvent) -> None:
+        """Emit a progress event if callback is set."""
+        if self.on_progress:
+            self.on_progress(event)
 
-async def run_analysis(
+    def report_done(self, status: StageStatus) -> None:
+        """Emit a DONE/ERROR event for a completed stage."""
+        self.report(
+            StageEvent(
+                name=status.name,
+                status=(
+                    StageProgress.DONE
+                    if status.ok
+                    else StageProgress.ERROR
+                ),
+                duration_ms=status.duration_ms,
+                message=status.error or "",
+            )
+        )
+
+
+def _build_context(
+    pid: str,
     repo_path: str | Path,
-    settings: Settings | None = None,
-    sections: list[str] | None = None,
-    branch: str = "main",
-    on_progress: ProgressCallback | None = None,
-    dispatcher: TraceDispatcher | None = None,
-    session_factory: Any | None = None,
-    project_id: str | None = None,
-) -> AnalysisResult:
-    """Run the full analysis pipeline.
-
-    Phases:
-      1. Ingestion: clone/copy -> detect languages -> chunk code
-      2+3. Dual analysis: static + LLM (concurrent via ParallelGroup)
-      4. Quality: cross-validate + build intelligence model
-      5. Section generation: 13 generators (concurrent via ParallelGroup)
-      6. Citation verification
-    """
-    cfg = settings or Settings()
-    pid = project_id or uuid.uuid4().hex[:ID_HEX_LENGTH]
-    result = AnalysisResult(project_id=pid)
-    t0 = time.monotonic()
-    trace_id = f"pipeline_{pid}"
-
-    target_sections = sections or list(SECTION_TITLES)
-
-    # Create checkpoint repo if session_factory is available
+    cfg: Settings,
+    branch: str,
+    dispatcher: TraceDispatcher | None,
+    session_factory: async_sessionmaker[AsyncSession] | None,
+    on_progress: ProgressCallback | None,
+) -> PipelineContext:
+    """Create a PipelineContext with optional checkpoint repo."""
     cp_repo = None
     if session_factory is not None:
         cp_repo = SqlCheckpointRepository(session_factory)
-
-    ctx = PipelineContext(
+    return PipelineContext(
         project_id=pid,
         repo_path=Path(repo_path),
         settings=cfg,
@@ -201,27 +183,85 @@ async def run_analysis(
         checkpoint_repo=cp_repo,
     )
 
-    def _report(event: StageEvent) -> None:
-        if on_progress:
-            on_progress(event)
 
-    def _done(s: StageStatus) -> None:
-        _report(
-            StageEvent(
-                name=s.name,
-                status=StageProgress.DONE if s.ok else StageProgress.ERROR,
-                duration_ms=s.duration_ms,
-                message=s.error or "",
-            )
-        )
+async def run_analysis(
+    repo_path: str | Path,
+    settings: Settings | None = None,
+    sections: list[str] | None = None,
+    branch: str = "main",
+    on_progress: ProgressCallback | None = None,
+    dispatcher: TraceDispatcher | None = None,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
+    project_id: str | None = None,
+) -> AnalysisResult:
+    """Run the full analysis pipeline.
+
+    Phases:
+      1. Ingestion: clone/copy -> detect languages -> chunk code
+      2+3. Dual analysis: static + LLM (concurrent via ParallelGroup)
+      4. Quality: cross-validate + build intelligence model
+      5. Section generation: 13 generators (concurrent via ParallelGroup)
+      6. Citation verification
+      7. Persistence
+    """
+    cfg = settings or Settings()
+    pid = project_id or uuid.uuid4().hex[:ID_HEX_LENGTH]
+    result = AnalysisResult(project_id=pid)
+    t0 = time.monotonic()
+    trace_id = f"pipeline_{pid}"
+    target_sections = sections or list(SECTION_TITLES)
+
+    ctx = _build_context(
+        pid,
+        repo_path,
+        cfg,
+        branch,
+        dispatcher,
+        session_factory,
+        on_progress,
+    )
 
     if dispatcher:
         await emit_pipeline_start(
             dispatcher, trace_id, pid
         )
 
-    # -- Phase 1: Ingestion (sequential) --
-    _report(
+    if not await _phase_ingestion(ctx, result):
+        return await _finalize(
+            result, t0, dispatcher, trace_id, success=False
+        )
+
+    await _phase_dual_analysis(ctx, result)
+
+    if not await _phase_quality(ctx, result):
+        return await _finalize(
+            result, t0, dispatcher, trace_id, success=False
+        )
+
+    await _phase_section_generation(
+        ctx, result, target_sections
+    )
+    await _phase_citation_verification(ctx, result)
+    await _phase_persistence(ctx, result)
+
+    return await _finalize(
+        result, t0, dispatcher, trace_id, success=True
+    )
+
+
+# -- Pipeline phase functions --
+
+
+async def _phase_ingestion(
+    ctx: PipelineContext,
+    result: AnalysisResult,
+) -> bool:
+    """Phase 1: Resolve repo, detect languages, chunk code.
+
+    Returns False if ingestion failed critically (no repo).
+    """
+    # 1a: Resolve repo
+    ctx.report(
         StageEvent(
             name="ingestion_resolve",
             status=StageProgress.RUNNING,
@@ -231,25 +271,21 @@ async def run_analysis(
     repo, status = await _run_stage(
         "ingestion_resolve",
         lambda: resolve_local_repo(
-            RepoSource(local_path=Path(repo_path), branch=branch),
-            cfg,
+            RepoSource(
+                local_path=ctx.repo_path, branch=ctx.branch
+            ),
+            ctx.settings,
         ),
     )
     result.stages.append(status)
-    _done(status)
+    ctx.report_done(status)
     if repo is None:
-        result.total_duration_ms = _elapsed(t0)
-        if dispatcher:
-            await emit_pipeline_end(
-                dispatcher,
-                trace_id,
-                _elapsed(t0),
-                success=False,
-            )
-        return result
+        return False
     ctx.repo = repo
+    ctx.commit_sha = repo.commit_sha
 
-    _report(
+    # 1b: Detect languages
+    ctx.report(
         StageEvent(
             name="ingestion_detect",
             status=StageProgress.RUNNING,
@@ -258,7 +294,7 @@ async def run_analysis(
     )
     lang_map, status = _run_stage_sync(
         "ingestion_detect",
-        lambda: detect_languages(repo, cfg),
+        lambda: detect_languages(repo, ctx.settings),
     )
     result.stages.append(status)
     ctx.lang_map = (
@@ -268,16 +304,24 @@ async def run_analysis(
     file_count = sum(
         li.file_count for li in ctx.lang_map.languages
     )
-    _report(
+    ctx.report(
         StageEvent(
             name="ingestion_detect",
-            status=StageProgress.DONE if status.ok else StageProgress.ERROR,
-            message=f"Detected {lang_count} languages across {file_count} files",
+            status=(
+                StageProgress.DONE
+                if status.ok
+                else StageProgress.ERROR
+            ),
+            message=(
+                f"Detected {lang_count} languages"
+                f" across {file_count} files"
+            ),
             duration_ms=status.duration_ms,
         )
     )
 
-    _report(
+    # 1c: Chunk code
+    ctx.report(
         StageEvent(
             name="ingestion_chunk",
             status=StageProgress.RUNNING,
@@ -287,7 +331,7 @@ async def run_analysis(
     chunks, status = _run_stage_sync(
         "ingestion_chunk",
         lambda: chunk_code(
-            repo, ctx.lang_map or LanguageMap(), cfg
+            repo, ctx.lang_map or LanguageMap(), ctx.settings
         ),
     )
     result.stages.append(status)
@@ -295,16 +339,30 @@ async def run_analysis(
         chunks if chunks is not None else ChunkedFiles()
     )
     chunk_count = len(ctx.chunks.chunks)
-    _report(
+    ctx.report(
         StageEvent(
             name="ingestion_chunk",
-            status=StageProgress.DONE if status.ok else StageProgress.ERROR,
-            message=f"Created {chunk_count} chunks from {ctx.chunks.total_files} files",
+            status=(
+                StageProgress.DONE
+                if status.ok
+                else StageProgress.ERROR
+            ),
+            message=(
+                f"Created {chunk_count} chunks"
+                f" from {ctx.chunks.total_files} files"
+            ),
             duration_ms=status.duration_ms,
         )
     )
 
-    # -- Phase 2+3: Static + LLM (concurrent via ParallelGroup) --
+    return True
+
+
+async def _phase_dual_analysis(
+    ctx: PipelineContext,
+    result: AnalysisResult,
+) -> None:
+    """Phase 2+3: Static + LLM analysis (concurrent via ParallelGroup)."""
     n_chunks = len(ctx.chunks.chunks) if ctx.chunks else 0
     n_code_chunks = (
         sum(
@@ -315,14 +373,17 @@ async def run_analysis(
         if ctx.chunks
         else 0
     )
-    _report(
+    ctx.report(
         StageEvent(
             name="static_analysis",
             status=StageProgress.RUNNING,
-            message=f"Analyzing {n_chunks} chunks (AST + call graph + deps)",
+            message=(
+                f"Analyzing {n_chunks} chunks"
+                f" (AST + call graph + deps)"
+            ),
         )
     )
-    _report(
+    ctx.report(
         StageEvent(
             name="llm_analysis",
             status=StageProgress.RUNNING,
@@ -332,6 +393,7 @@ async def run_analysis(
             ),
         )
     )
+
     analysis_group: ParallelGroup[PipelineContext] = (
         ParallelGroup(
             name="dual_analysis",
@@ -356,15 +418,23 @@ async def run_analysis(
             error=sr.error,
         )
         result.stages.append(ss)
-        _done(ss)
+        ctx.report_done(ss)
 
     if ctx.static is None:
         ctx.static = StaticAnalysisResult()
     if ctx.llm is None:
         ctx.llm = LLMAnalysisResult()
 
-    # -- Phase 4: Quality + Model (sequential) --
-    _report(
+
+async def _phase_quality(
+    ctx: PipelineContext,
+    result: AnalysisResult,
+) -> bool:
+    """Phase 4: Cross-validate + build intelligence model.
+
+    Returns False if model build failed.
+    """
+    ctx.report(
         StageEvent(
             name="quality",
             status=StageProgress.RUNNING,
@@ -379,14 +449,14 @@ async def run_analysis(
         ),
     )
     result.stages.append(status)
-    _done(status)
+    ctx.report_done(status)
     ctx.validation = (
         validation
         if validation is not None
         else ValidationResult()
     )
 
-    _report(
+    ctx.report(
         StageEvent(
             name="intelligence_model",
             status=StageProgress.RUNNING,
@@ -396,38 +466,41 @@ async def run_analysis(
     model, status = _run_stage_sync(
         "intelligence_model",
         lambda: build_intelligence_model(
-            pid,
+            ctx.project_id,
             ctx.validation or ValidationResult(),
             ctx.static or StaticAnalysisResult(),
             ctx.llm or LLMAnalysisResult(),
         ),
     )
     result.stages.append(status)
-    _done(status)
+    ctx.report_done(status)
     if model is None:
-        result.total_duration_ms = _elapsed(t0)
-        if dispatcher:
-            await emit_pipeline_end(
-                dispatcher,
-                trace_id,
-                _elapsed(t0),
-                success=False,
-            )
-        return result
+        return False
     ctx.model = model
     result.model = model
+    return True
 
-    # -- Phase 5: Section Generation (concurrent via ParallelGroup) --
-    _report(
+
+async def _phase_section_generation(
+    ctx: PipelineContext,
+    result: AnalysisResult,
+    target_sections: list[str],
+) -> None:
+    """Phase 5: Generate documentation sections (concurrent)."""
+    ctx.report(
         StageEvent(
             name="section_generation",
             status=StageProgress.RUNNING,
-            message=f"Generating {len(target_sections)} documentation sections",
+            message=(
+                f"Generating {len(target_sections)}"
+                " documentation sections"
+            ),
         )
     )
-    section_stages: list[PipelineStage[PipelineContext, Any]] = (
-        []
-    )
+
+    section_stages: list[
+        PipelineStage[PipelineContext, Any]
+    ] = []
     for name in target_sections:
         gen = SECTION_GENERATORS.get(name)
         if gen is None:
@@ -447,7 +520,9 @@ async def run_analysis(
             ParallelGroup(
                 name="section_generation",
                 stages=section_stages,
-                max_concurrency=cfg.analysis_max_concurrency,
+                max_concurrency=(
+                    ctx.settings.analysis_max_concurrency
+                ),
             )
         )
         section_results = await section_group.execute(ctx)
@@ -461,8 +536,10 @@ async def run_analysis(
             )
             result.stages.append(ss)
 
-            # If a section stage failed, create a degraded placeholder
-            if sr.status == StageOutcome.FAILED and sr.error:
+            if (
+                sr.status == StageOutcome.FAILED
+                and sr.error
+            ):
                 sn = sr.stage_name.removeprefix(
                     "generate_"
                 )
@@ -481,90 +558,118 @@ async def run_analysis(
 
     result.sections = list(ctx.sections)
 
-    # -- Phase 6: Citation Verification --
+
+async def _phase_citation_verification(
+    ctx: PipelineContext,
+    result: AnalysisResult,
+) -> None:
+    """Phase 6: Verify citations against source tree."""
     all_citations = [
         c
         for section in result.sections
         for c in section.citations
     ]
-    if all_citations:
-        _report(
-            StageEvent(
-                name="citation_verification",
-                status=StageProgress.RUNNING,
-                message="Verifying citations...",
-            )
+    if not all_citations:
+        return
+
+    ctx.report(
+        StageEvent(
+            name="citation_verification",
+            status=StageProgress.RUNNING,
+            message="Verifying citations...",
         )
-        guardrail_results, status = _run_stage_sync(
-            "citation_verification",
-            lambda: verify_citations(
-                all_citations, Path(repo_path)
+    )
+    guardrail_results, status = _run_stage_sync(
+        "citation_verification",
+        lambda: verify_citations(
+            all_citations, ctx.repo_path
+        ),
+    )
+    result.stages.append(status)
+    ctx.report_done(status)
+    if guardrail_results is not None:
+        valid_count = sum(
+            1 for r in guardrail_results if r.passed
+        )
+        result.quality_report = QualityReport(
+            guardrail_results=guardrail_results,
+            citations_checked=len(all_citations),
+            citations_valid=valid_count,
+            avg_confidence=_avg_confidence(
+                result.sections
             ),
         )
-        result.stages.append(status)
-        _done(status)
-        if guardrail_results is not None:
-            valid_count = sum(
-                1 for r in guardrail_results if r.passed
-            )
-            result.quality_report = QualityReport(
-                guardrail_results=guardrail_results,
-                citations_checked=len(all_citations),
-                citations_valid=valid_count,
-                avg_confidence=_avg_confidence(
-                    result.sections
-                ),
-            )
 
-    # -- Phase 7: Persist to database --
-    if session_factory is not None:
-        _report(
+
+async def _phase_persistence(
+    ctx: PipelineContext,
+    result: AnalysisResult,
+) -> None:
+    """Phase 7: Persist results to database."""
+    if ctx.session_factory is None:
+        return
+
+    ctx.report(
+        StageEvent(
+            name="persistence",
+            status=StageProgress.RUNNING,
+            message=(
+                f"Persisting {len(result.sections)}"
+                " sections..."
+            ),
+        )
+    )
+    t_persist = time.monotonic()
+    try:
+        from artifactor.services.analysis_persistence import (
+            AnalysisPersistenceService,
+        )
+
+        svc = AnalysisPersistenceService(
+            ctx.session_factory
+        )
+        await svc.persist(ctx.project_id, result)
+        ctx.report(
             StageEvent(
                 name="persistence",
-                status=StageProgress.RUNNING,
+                status=StageProgress.DONE,
                 message=(
-                    f"Persisting {len(result.sections)} sections..."
+                    f"Persisted {len(result.sections)}"
+                    " sections"
                 ),
+                duration_ms=_elapsed(t_persist),
             )
         )
-        t_persist = time.monotonic()
-        try:
-            from artifactor.services.analysis_persistence import (
-                AnalysisPersistenceService,
+    except Exception:
+        logger.exception(
+            "event=persist_failed project_id=%s",
+            ctx.project_id,
+        )
+        ctx.report(
+            StageEvent(
+                name="persistence",
+                status=StageProgress.ERROR,
+                message="Failed to persist results",
             )
+        )
 
-            svc = AnalysisPersistenceService(session_factory)
-            await svc.persist(pid, result)
-            _report(
-                StageEvent(
-                    name="persistence",
-                    status=StageProgress.DONE,
-                    message=(
-                        f"Persisted {len(result.sections)}"
-                        " sections"
-                    ),
-                    duration_ms=_elapsed(t_persist),
-                )
-            )
-        except Exception:
-            logger.exception(
-                "event=persist_failed project_id=%s", pid
-            )
-            _report(
-                StageEvent(
-                    name="persistence",
-                    status=StageProgress.ERROR,
-                    message="Failed to persist results",
-                )
-            )
 
+async def _finalize(
+    result: AnalysisResult,
+    t0: float,
+    dispatcher: TraceDispatcher | None,
+    trace_id: str,
+    *,
+    success: bool,
+) -> AnalysisResult:
+    """Set total duration and emit pipeline end trace."""
     result.total_duration_ms = _elapsed(t0)
     if dispatcher:
         await emit_pipeline_end(
             dispatcher,
             trace_id,
             result.total_duration_ms,
-            success=True,
+            success=success,
         )
     return result
 

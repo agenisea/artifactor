@@ -313,9 +313,6 @@ def _run_mcp(args: argparse.Namespace) -> None:
     db_url = settings.database_url
     if args.db:
         db_url = f"sqlite:///{args.db}"
-    db_url = db_url.replace(
-        "sqlite:///", "sqlite+aiosqlite:///"
-    )
 
     asyncio.run(
         _setup_and_run_mcp(
@@ -335,22 +332,13 @@ async def _setup_and_run_mcp(
     host: str = "0.0.0.0",
     port: int = 8001,
 ) -> None:
-    """Initialize engine, set WAL, run MCP, dispose engine."""
-    from sqlalchemy import text
-    from sqlalchemy.ext.asyncio import (
-        async_sessionmaker,
-        create_async_engine,
-    )
+    """Initialize engine, run MCP, dispose engine."""
+    from sqlalchemy.ext.asyncio import async_sessionmaker
 
+    from artifactor.config import create_app_engine
     from artifactor.mcp import configure, mcp
 
-    engine = create_async_engine(db_url)
-
-    # WAL mode: allow concurrent reads from the backend
-    async with engine.begin() as conn:
-        await conn.execute(
-            text("PRAGMA journal_mode=WAL")
-        )
+    engine = create_app_engine(db_url)
 
     session_factory = async_sessionmaker(
         engine, expire_on_commit=False
